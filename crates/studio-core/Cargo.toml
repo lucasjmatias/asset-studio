@@ -1,0 +1,16 @@
+[package]
+name = "asset-studio-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared affine transform core for Asset Studio"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+approx = "0.5"
