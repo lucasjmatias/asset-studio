@@ -5,9 +5,10 @@
   import { readTextFile } from "@tauri-apps/plugin-fs";
   import initStudioCore, { transform_matrix } from "$lib/wasm/studio_core.js";
   import { composeBoneTransform, createPose, identityBoneTransform, identityTransform, relativeBoneTransform, type Bone, type BonePoseTransform, type GroupTransform, type PixelResizeMode, type Pose, type SvgGroup } from "$lib/editor/model";
-  import { prepareSvg, selectWrapper, serializeForExport, setWrapperMatrix } from "$lib/editor/svg";
+  import { highlightBoneWrapper, prepareSvg, selectWrapper, serializeForExport, setWrapperMatrix, setWrapperVisibility } from "$lib/editor/svg";
   import { loadCanvasKit, rasterizeSvg, renderEncodedPixelPreview, renderPixelPreview } from "$lib/editor/pixel-preview";
   import { boneDepth, boneGroupMatrices, boneWorldMap, invertMatrix, matrixInParentSpace, multiplyMatrix, wouldCreateCycle, type Matrix } from "$lib/editor/rig";
+  import { appendHistory, cloneSerializable, snapshotsEqual, type HistoryEntry } from "$lib/editor/history";
   import "./studio.css";
 
   type EditorTool = "move" | "rotate" | "scale";
@@ -15,8 +16,9 @@
   type BoneGesture = "move" | "rotate-start" | "rotate-end" | "scale-start" | "scale-end";
   type PrimaryView = "vector" | "rig";
   type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number };
-  type DragState = { pointerId: number; key: string; startPoint: DOMPoint; startTransform: GroupTransform; inverse: DOMMatrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number };
-  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number } };
+  type DocumentSnapshot = { poses: Pose[]; bones: Bone[]; setupBoneTransforms: Record<string, BonePoseTransform>; activePoseId: string; selectedGroupKey: string | null; selectedBoneId: string | null };
+  type DragState = { pointerId: number; key: string; startPoint: DOMPoint; startTransform: GroupTransform; inverse: DOMMatrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number; historyBefore: DocumentSnapshot };
+  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; historyBefore: DocumentSnapshot };
 
   const cursorSvg = (body: string, fallback: string, angle = 0) => `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><g transform="rotate(${angle} 16 16)" fill="none" stroke="#f4c96d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="#101416" stroke-width="4" d="${body}"/><path d="${body}"/></g></svg>`)}") 16 16, ${fallback}`;
   const moveCursor = cursorSvg("M16 3l-4 4m4-4l4 4M16 29l-4-4m4 4l4-4M3 16l4-4m-4 4l4 4M29 16l-4-4m4 4l-4 4M16 4v24M4 16h24", "move");
@@ -67,6 +69,8 @@
   let previewTimer: ReturnType<typeof setTimeout> | null = null;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   let setupFrozenMatrices: Record<string, Matrix> = {};
+  let undoStack = $state<HistoryEntry<DocumentSnapshot>[]>([]);
+  let redoStack = $state<HistoryEntry<DocumentSnapshot>[]>([]);
   const pivots: Record<string, { x: number; y: number }> = {};
   const worldPivots: Record<string, { x: number; y: number }> = {};
   const wrapperParentMatrices: Record<string, Matrix> = {};
@@ -100,7 +104,7 @@
         const migrated = legacy.boneTransforms ?? Object.fromEntries(
           Object.entries(legacy.boneRotations ?? {}).map(([id, rotation]) => [id, { ...identityBoneTransform(), rotation }]),
         );
-        return { ...pose, boneTransforms: migrated };
+        return { ...pose, boneTransforms: migrated, visibility: pose.visibility ?? {} };
       });
       bones = session.bones ?? [];
       const restoredActivePoseId = restoredPoses.some((pose) => pose.id === session.activePoseId) ? session.activePoseId : "rest";
@@ -144,8 +148,50 @@
   });
 
   function isTauri() { return "__TAURI_INTERNALS__" in window; }
+  function captureDocument(): DocumentSnapshot {
+    return cloneSerializable({ poses, bones, setupBoneTransforms, activePoseId, selectedGroupKey, selectedBoneId });
+  }
+  function commitHistory(label: string, before: DocumentSnapshot) {
+    const after = captureDocument();
+    if (snapshotsEqual(before, after)) return;
+    undoStack = appendHistory(undoStack, { label, before, after });
+    redoStack = [];
+  }
+  function restoreDocument(snapshot: DocumentSnapshot) {
+    const restored = cloneSerializable(snapshot);
+    poses = restored.poses;
+    bones = restored.bones;
+    setupBoneTransforms = restored.setupBoneTransforms;
+    activePoseId = poses.some((pose) => pose.id === snapshot.activePoseId) ? snapshot.activePoseId : "rest";
+    selectedGroupKey = groups.some((group) => group.key === snapshot.selectedGroupKey) ? snapshot.selectedGroupKey : null;
+    selectedBoneId = bones.some((bone) => bone.id === snapshot.selectedBoneId) ? snapshot.selectedBoneId : null;
+    if (activePoseId === "rest" && rigEditMode === "pose") rigEditMode = "setup";
+    if (rigEditMode === "setup") setupFrozenMatrices = calculatedGroupMatrices();
+    applyAllTransforms(); dirty = true; schedulePersist();
+  }
+  function undo() {
+    const entry = undoStack.at(-1);
+    if (!entry) { status = "Nothing to undo"; return; }
+    if (isPlaying) stopPlayback();
+    undoStack = undoStack.slice(0, -1);
+    redoStack = [...redoStack, entry];
+    restoreDocument(entry.before);
+    status = `Undo · ${entry.label}`;
+  }
+  function redo() {
+    const entry = redoStack.at(-1);
+    if (!entry) { status = "Nothing to redo"; return; }
+    if (isPlaying) stopPlayback();
+    redoStack = redoStack.slice(0, -1);
+    undoStack = [...undoStack, entry];
+    restoreDocument(entry.after);
+    status = `Redo · ${entry.label}`;
+  }
   function currentTransform(key: string): GroupTransform {
     return transformForPose(key, activePose);
+  }
+  function groupIsVisible(key: string, pose: Pose | null = activePose) {
+    return pose?.visibility?.[key] !== false;
   }
   function transformForPose(key: string, pose: Pose | null): GroupTransform {
     const pivot = pivots[key] ?? { x: 0, y: 0 };
@@ -172,8 +218,12 @@
     if (!svgHost) return;
     const calculated = calculatedGroupMatrices();
     const freezeRig = viewMode === "rig" && rigEditMode === "setup" && !isPlaying;
-    for (const group of groups) setWrapperMatrix(svgHost, group.key, freezeRig && setupFrozenMatrices[group.key] ? setupFrozenMatrices[group.key] : calculated[group.key]);
+    for (const group of groups) {
+      setWrapperMatrix(svgHost, group.key, freezeRig && setupFrozenMatrices[group.key] ? setupFrozenMatrices[group.key] : calculated[group.key]);
+      setWrapperVisibility(svgHost, group.key, groupIsVisible(group.key));
+    }
     selectWrapper(svgHost, selectedGroupKey);
+    highlightBoneWrapper(svgHost, selectedBone?.groupKey ?? null);
     schedulePreview();
   }
   function setRigEditMode(mode: RigEditMode) {
@@ -235,7 +285,7 @@
   async function loadSvgSource(svg: string, name: string, persist = true) {
     const prepared = prepareSvg(svg);
     sourceSvg = svg; fileName = name; groups = prepared.groups; warnings = prepared.warnings; viewBox = prepared.viewBox;
-    selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; poses = []; bones = []; setupBoneTransforms = {}; activePoseId = "rest";
+    selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; poses = []; bones = []; setupBoneTransforms = {}; activePoseId = "rest"; undoStack = []; redoStack = [];
     svgHost.innerHTML = prepared.markup;
     requestAnimationFrame(() => { collectPivots(); applyAllTransforms(); });
     status = `${groups.length} editable group${groups.length === 1 ? "" : "s"} indexed`;
@@ -261,19 +311,25 @@
   function selectGroup(key: string) { selectedGroupKey = key; selectWrapper(svgHost, key); }
   function addPose() {
     if (!sourceSvg) return;
-    const pose = createPose(`Pose ${String(poses.length + 1).padStart(2, "0")}`, activePose?.transforms ?? {}, activePose?.boneTransforms ?? {});
+    const before = captureDocument();
+    const pose = createPose(`Pose ${String(poses.length + 1).padStart(2, "0")}`, activePose?.transforms ?? {}, activePose?.boneTransforms ?? {}, activePose?.visibility ?? {});
     poses = [...poses, pose]; activePoseId = pose.id; dirty = false; applyAllTransforms(); schedulePersist();
+    commitHistory("Create pose", before);
     status = `${pose.name} created as an independent pose`;
   }
   function duplicatePose() {
     if (!activePose) return;
-    const pose = createPose(`${activePose.name} copy`, activePose.transforms, activePose.boneTransforms);
+    const before = captureDocument();
+    const pose = createPose(`${activePose.name} copy`, activePose.transforms, activePose.boneTransforms, activePose.visibility);
     poses = [...poses, pose]; activePoseId = pose.id; dirty = false; applyAllTransforms(); schedulePersist();
+    commitHistory("Duplicate pose", before);
   }
   function deletePose(pose: Pose) {
+    const before = captureDocument();
     poses = poses.filter((item) => item.id !== pose.id);
     if (activePoseId === pose.id) activePoseId = "rest";
     dirty = false; applyAllTransforms(); schedulePersist();
+    commitHistory("Delete pose", before);
   }
   function choosePose(id: string, fromPlayback = false) {
     if (!fromPlayback && isPlaying) stopPlayback();
@@ -313,14 +369,33 @@
   function renamePose(event: Event) {
     if (!activePose) return;
     const name = (event.currentTarget as HTMLInputElement).value.trim();
-    if (name) { poses = poses.map((pose) => pose.id === activePose.id ? { ...pose, name } : pose); schedulePersist(); }
+    if (name && name !== activePose.name) {
+      const before = captureDocument();
+      poses = poses.map((pose) => pose.id === activePose.id ? { ...pose, name } : pose);
+      commitHistory("Rename pose", before); schedulePersist();
+    }
   }
-  function updateTransform(key: string, next: GroupTransform, preview = true) {
+  function updateTransform(key: string, next: GroupTransform, preview = true, record = true) {
     if (!activePose) return;
+    const before = record ? captureDocument() : null;
     poses = poses.map((pose) => pose.id === activePose.id ? { ...pose, transforms: { ...pose.transforms, [key]: { ...next } } } : pose);
     applyAllTransforms(); dirty = true;
     if (preview) schedulePreview();
     schedulePersist();
+    if (before) commitHistory("Transform group", before);
+  }
+
+  function toggleGroupVisibility(group: SvgGroup, event: MouseEvent) {
+    event.stopPropagation();
+    if (!activePose) { status = "REST is protected. Create a pose to change layer visibility."; return; }
+    const before = captureDocument();
+    const visible = !groupIsVisible(group.key);
+    poses = poses.map((pose) => pose.id === activePose.id
+      ? { ...pose, visibility: { ...(pose.visibility ?? {}), [group.key]: visible } }
+      : pose);
+    applyAllTransforms(); dirty = true; schedulePersist();
+    commitHistory(`${visible ? "Show" : "Hide"} ${group.label}`, before);
+    status = `${group.label} ${visible ? "shown" : "hidden"} in ${activePose.name}`;
   }
   function changeTransform(field: keyof GroupTransform, event: Event) {
     if (!selectedGroupKey || !activePose) return;
@@ -334,10 +409,12 @@
   }
   function selectBone(id: string) {
     selectedBoneId = id;
+    highlightBoneWrapper(svgHost, bones.find((bone) => bone.id === id)?.groupKey ?? null);
     if (viewMode !== "rig") showRig(); else leftMode = "rig";
   }
   function addBone() {
     if (!sourceSvg) return;
+    const before = captureDocument();
     const parent = bones.find((bone) => bone.id === selectedBoneId) ?? null;
     const pivot = selectedGroupKey ? worldPivots[selectedGroupKey] : null;
     const group = groups.find((item) => item.key === selectedGroupKey);
@@ -357,11 +434,14 @@
     bones = [...bones.map((item) => item.groupKey === bone.groupKey ? { ...item, groupKey: null } : item), bone];
     selectedBoneId = bone.id; showRig();
     applyAllTransforms(); schedulePersist();
+    commitHistory("Add bone", before);
     status = parent ? `${bone.name} added as a child of ${parent.name}` : `${bone.name} root created`;
   }
-  function updateBone(next: Bone) {
+  function updateBone(next: Bone, label = "Edit bone") {
+    const before = captureDocument();
     bones = bones.map((bone) => bone.id === next.id ? { ...next } : bone);
     applyAllTransforms(); schedulePersist();
+    commitHistory(label, before);
   }
   function changeBoneNumber(field: "x" | "y" | "length" | "restRotation", event: Event) {
     if (!selectedBone) return;
@@ -382,15 +462,18 @@
   }
   function changeBoneBinding(event: Event) {
     if (!selectedBone) return;
+    const before = captureDocument();
     const groupKey = (event.currentTarget as HTMLSelectElement).value || null;
     bones = bones.map((bone) => bone.id === selectedBone.id
       ? { ...bone, groupKey }
       : groupKey && bone.groupKey === groupKey ? { ...bone, groupKey: null } : bone);
     applyAllTransforms(); schedulePersist();
+    commitHistory("Bind bone to group", before);
     status = groupKey ? `${selectedBone.name} bound to ${groups.find((group) => group.key === groupKey)?.label}` : `${selectedBone.name} unbound`;
   }
   function deleteBone() {
     if (!selectedBone) return;
+    const before = captureDocument();
     const removed = new Set([selectedBone.id]);
     let changed = true;
     while (changed) {
@@ -401,6 +484,7 @@
     setupBoneTransforms = Object.fromEntries(Object.entries(setupBoneTransforms).filter(([id]) => !removed.has(id)));
     poses = poses.map((pose) => ({ ...pose, boneTransforms: Object.fromEntries(Object.entries(pose.boneTransforms ?? {}).filter(([id]) => !removed.has(id))) }));
     selectedBoneId = null; applyAllTransforms(); schedulePersist();
+    commitHistory("Delete bone chain", before);
     status = `${removed.size} bone${removed.size === 1 ? "" : "s"} removed`;
   }
   function currentSetupBoneTransform(id: string): BonePoseTransform { return setupBoneTransforms[id] ?? identityBoneTransform(); }
@@ -411,18 +495,22 @@
   function effectiveBoneTransforms(pose: Pose | null): Record<string, BonePoseTransform> {
     return Object.fromEntries(bones.map((bone) => [bone.id, effectiveBoneTransform(bone.id, pose)]));
   }
-  function updateSetupBoneTransform(id: string, transform: BonePoseTransform, preview = true) {
+  function updateSetupBoneTransform(id: string, transform: BonePoseTransform, preview = true, record = true) {
+    const before = record ? captureDocument() : null;
     setupBoneTransforms = { ...setupBoneTransforms, [id]: { ...transform } };
     applyAllTransforms(); dirty = true;
     if (preview) schedulePreview();
     schedulePersist();
+    if (before) commitHistory("Adjust rig setup", before);
   }
-  function updateBonePose(id: string, transform: BonePoseTransform, preview = true) {
+  function updateBonePose(id: string, transform: BonePoseTransform, preview = true, record = true) {
     if (!activePose) return;
+    const before = record ? captureDocument() : null;
     poses = poses.map((pose) => pose.id === activePose.id ? { ...pose, boneTransforms: { ...(pose.boneTransforms ?? {}), [id]: { ...transform } } } : pose);
     applyAllTransforms(); dirty = true;
     if (preview) schedulePreview();
     schedulePersist();
+    if (before) commitHistory("Pose bone", before);
   }
   function changeBoneRotation(event: Event) {
     if (!selectedBone || (rigEditMode === "pose" && !activePose)) return;
@@ -479,8 +567,8 @@
       scaleX,
       scaleY,
     };
-    if (rigEditMode === "setup") updateSetupBoneTransform(state.boneId, relativeBoneTransform(effective, state.startPose), false);
-    else updateBonePose(state.boneId, relativeBoneTransform(effective, state.startSetup), false);
+    if (rigEditMode === "setup") updateSetupBoneTransform(state.boneId, relativeBoneTransform(effective, state.startPose), false, false);
+    else updateBonePose(state.boneId, relativeBoneTransform(effective, state.startSetup), false, false);
   }
   function bonePointerDown(event: PointerEvent, boneId: string, gesture: BoneGesture) {
     selectBone(boneId);
@@ -504,6 +592,7 @@
       startEffective: { ...effectiveBoneTransform(boneId) },
       parentInverse: parentMatrix ? invertMatrix(parentMatrix) : [1, 0, 0, 1, 0, 0],
       startWorld: { startX: world.startX, startY: world.startY, endX: world.endX, endY: world.endY },
+      historyBefore: captureDocument(),
     };
     rigSvg?.setPointerCapture(event.pointerId);
     event.preventDefault(); event.stopPropagation();
@@ -544,7 +633,8 @@
   }
   function bonePointerUp(event: PointerEvent) {
     if (!boneDrag || boneDrag.pointerId !== event.pointerId) return;
-    boneDrag = null; schedulePreview(); status = rigEditMode === "setup" ? "Guide placement updated; artwork remains frozen" : `${activePose?.name ?? "Pose"} rig transform updated`;
+    const before = boneDrag.historyBefore;
+    boneDrag = null; commitHistory("Transform bone", before); schedulePreview(); status = rigEditMode === "setup" ? "Guide placement updated; artwork remains frozen" : `${activePose?.name ?? "Pose"} rig transform updated`;
   }
   function pointerDown(event: PointerEvent) {
     if (viewMode === "rig") return;
@@ -565,6 +655,7 @@
       startDistance: Math.max(1, Math.hypot(startPoint.x - pivot.x, startPoint.y - pivot.y)),
       startDx: startPoint.x - pivot.x,
       startDy: startPoint.y - pivot.y,
+      historyBefore: captureDocument(),
     };
     svgHost.setPointerCapture(event.pointerId); event.preventDefault();
   }
@@ -572,23 +663,34 @@
     if (!drag || drag.pointerId !== event.pointerId) return;
     const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(drag.inverse);
     if (activeTool === "move") {
-      updateTransform(drag.key, { ...drag.startTransform, x: drag.startTransform.x + point.x - drag.startPoint.x, y: drag.startTransform.y + point.y - drag.startPoint.y }, false);
+      updateTransform(drag.key, { ...drag.startTransform, x: drag.startTransform.x + point.x - drag.startPoint.x, y: drag.startTransform.y + point.y - drag.startPoint.y }, false, false);
     } else if (activeTool === "rotate") {
       const angle = Math.atan2(point.y - drag.pivot.y, point.x - drag.pivot.x);
-      updateTransform(drag.key, { ...drag.startTransform, rotation: drag.startTransform.rotation + (angle - drag.startAngle) * 180 / Math.PI }, false);
+      updateTransform(drag.key, { ...drag.startTransform, rotation: drag.startTransform.rotation + (angle - drag.startAngle) * 180 / Math.PI }, false, false);
     } else {
       const basis = Math.max(20, Math.min(viewBox[2], viewBox[3]) * 0.25);
       const factorX = 1 + (point.x - drag.startPoint.x) / basis;
       const factorY = 1 + (point.y - drag.startPoint.y) / basis;
       const pair = scalePair(factorX, factorY, drag.startTransform.scaleX, drag.startTransform.scaleY);
-      updateTransform(drag.key, { ...drag.startTransform, scaleX: pair.x, scaleY: pair.y }, false);
+      updateTransform(drag.key, { ...drag.startTransform, scaleX: pair.x, scaleY: pair.y }, false, false);
     }
   }
   function pointerUp(event: PointerEvent) {
     if (!drag || drag.pointerId !== event.pointerId) return;
-    drag = null; schedulePreview(); status = `${activePose?.name ?? "Pose"} updated`;
+    const before = drag.historyBefore;
+    drag = null; commitHistory("Transform group", before); schedulePreview(); status = `${activePose?.name ?? "Pose"} updated`;
   }
   function keyboardHandler(event: KeyboardEvent) {
+    const shortcut = event.ctrlKey || event.metaKey;
+    const shortcutKey = event.key.toLowerCase();
+    if (shortcut && !event.altKey && shortcutKey === "z") {
+      event.preventDefault();
+      if (event.shiftKey) redo(); else undo();
+      return;
+    }
+    if (shortcut && !event.altKey && shortcutKey === "y") {
+      event.preventDefault(); redo(); return;
+    }
     if ((event.target as HTMLElement | null)?.matches("input,select,textarea")) return;
     const key = event.key.toLowerCase();
     if (key === "v") { activeTool = "move"; return; }
@@ -678,7 +780,10 @@
   }
   function serializePoseFrame(pose: Pose | null): string {
     const matrices = calculatedGroupMatricesFor(pose);
-    for (const group of groups) setWrapperMatrix(svgHost, group.key, matrices[group.key]);
+    for (const group of groups) {
+      setWrapperMatrix(svgHost, group.key, matrices[group.key]);
+      setWrapperVisibility(svgHost, group.key, groupIsVisible(group.key, pose));
+    }
     return serializeForExport(svgHost);
   }
   function serializeAllFrames(): string[] {
@@ -726,7 +831,7 @@
   <header class="topbar">
     <div class="brand-block"><span class="brand-mark">AS</span><div><strong>ASSET/STUDIO</strong><small>VECTOR POSE LAB</small></div></div>
     <div class="document-pill" title={fileName}><span class:live={Boolean(sourceSvg)}></span><div><small>SOURCE · READ ONLY</small><strong>{fileName}</strong></div></div>
-    <div class="top-actions"><button class="button ghost" onclick={openSvg}><span>↗</span> Open SVG</button><button class="button primary" disabled={!sourceSvg} onclick={exportPng}><span>↓</span> Export PNG</button></div>
+    <div class="top-actions"><div class="history-actions" aria-label="Edit history"><button disabled={!undoStack.length} onclick={undo} title="Undo (Ctrl+Z)">↶<small>CTRL Z</small></button><button disabled={!redoStack.length} onclick={redo} title="Redo (Ctrl+Y)">↷<small>CTRL Y</small></button></div><button class="button ghost" onclick={openSvg}><span>↗</span> Open SVG</button><button class="button primary" disabled={!sourceSvg} onclick={exportPng}><span>↓</span> Export PNG</button></div>
   </header>
 
   <section class="workspace">
@@ -737,10 +842,15 @@
         {#if groups.length}
           <div class="group-list">
             {#each groups as group, index}
-              <button class:selected={selectedGroupKey === group.key} class="group-row" style={`--depth:${group.depth}`} onclick={() => selectGroup(group.key)}>
-                <span class="disclosure">{group.parentKey ? "└" : "◆"}</span><span class="group-icon">G</span>
-                <span class="group-copy"><strong>{group.label}</strong><small>{group.sourceId ? `#${group.sourceId}` : `GROUP ${String(index + 1).padStart(2, "0")}`}</small></span>
-              </button>
+              {@const visible = groupIsVisible(group.key)}
+              {@const boneBound = selectedBone?.groupKey === group.key}
+              <div class:selected={selectedGroupKey === group.key} class:bound={boneBound} class:layer-hidden={!visible} class="layer-row" style={`--depth:${group.depth}`}>
+                <button class="layer-select" onclick={() => selectGroup(group.key)}>
+                  <span class="disclosure">{group.parentKey ? "└" : "◆"}</span><span class="group-icon">G</span>
+                  <span class="group-copy"><strong>{group.label}</strong><small>{group.sourceId ? `#${group.sourceId}` : `GROUP ${String(index + 1).padStart(2, "0")}`}{#if boneBound}<em> · BONE LINK</em>{/if}</small></span>
+                </button>
+                <button class:off={!visible} class="visibility-toggle" aria-label={`${visible ? "Hide" : "Show"} ${group.label} in this pose`} aria-pressed={!visible} title={activePose ? `${visible ? "Hide" : "Show"} in ${activePose.name}` : "Rest visibility is locked"} onclick={(event) => toggleGroupVisibility(group, event)}><span></span></button>
+              </div>
             {/each}
           </div>
         {:else}

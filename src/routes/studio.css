@@ -24,6 +24,11 @@ button { color: inherit; }
 .document-pill small { color: var(--muted); font: 9px "Cascadia Mono", monospace; letter-spacing: .15em; }
 .document-pill strong { margin-top: 2px; font-size: 12px; font-weight: 500; }
 .top-actions { display: flex; gap: 8px; padding-right: 14px; }
+.history-actions { display: flex; height: 36px; border: 1px solid var(--line); background: #0e1214; }
+.history-actions button { width: 45px; border: 0; border-right: 1px solid var(--line); background: transparent; color: #aeb7b8; cursor: pointer; font: 17px/1 "Cascadia Mono", monospace; }
+.history-actions button:last-child { border-right: 0; }
+.history-actions button:hover:not(:disabled) { background: #232a2d; color: var(--acid); }
+.history-actions small { display: block; margin-top: 2px; color: #596367; font-size: 5px; letter-spacing: .03em; }
 .button { height: 36px; padding: 0 16px; border: 1px solid var(--line); background: transparent; cursor: pointer; font-size: 11px; font-weight: 700; letter-spacing: .08em; }
 .button span { margin-right: 7px; font-family: monospace; }
 .button:hover { border-color: #687276; background: #1c2124; }
@@ -46,6 +51,21 @@ h2 { margin: 2px 0 0; font-size: 16px; font-weight: 600; letter-spacing: .04em; 
 .rig-tools button { width: 100%; height: 34px; border: 1px solid #6d5c39; background: #25221b; color: var(--acid); cursor: pointer; font: 8px "Cascadia Mono", monospace; letter-spacing: .09em; }
 .rig-tools small { display: block; margin-top: 7px; overflow: hidden; color: #717b7f; font: 7px "Cascadia Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
 .group-list { padding: 8px; overflow-y: auto; }
+.layer-row { position: relative; width: 100%; height: 48px; display: grid; grid-template-columns: minmax(0,1fr) 34px; align-items: stretch; border: 1px solid transparent; background: transparent; }
+.layer-row:hover { background: #1d2226; }
+.layer-row.selected { border-color: #695938; background: #29251d; }
+.layer-row.bound { border-color: #47767b; background: linear-gradient(90deg,#183035 0,#1b2427 58%,#171b1e 100%); box-shadow: inset 3px 0 #71b9c1; }
+.layer-row.bound.selected { border-color: #c69745; background: linear-gradient(90deg,#263331,#29251d 62%); box-shadow: inset 3px 0 #71b9c1,inset 0 -1px var(--acid); }
+.layer-select { min-width: 0; display: grid; grid-template-columns: 14px 28px minmax(0,1fr); align-items: center; gap: 7px; padding: 0 4px 0 calc(7px + var(--depth) * 12px); border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.layer-row.layer-hidden .layer-select { opacity: .42; }
+.visibility-toggle { position: relative; align-self: center; width: 28px; height: 28px; padding: 0; border: 1px solid transparent; border-radius: 50%; background: transparent; cursor: pointer; }
+.visibility-toggle:hover { border-color: #465055; background: #101416; }
+.visibility-toggle > span { position: absolute; left: 6px; top: 9px; width: 14px; height: 9px; border: 1.5px solid #9ba5a7; border-radius: 50% / 60%; }
+.visibility-toggle > span::after { content: ""; position: absolute; left: 4px; top: 2px; width: 4px; height: 4px; border-radius: 50%; background: var(--acid); }
+.visibility-toggle.off > span { border-color: #596266; }
+.visibility-toggle.off > span::before { content: ""; position: absolute; left: 5px; top: -4px; width: 1.5px; height: 17px; background: var(--signal); transform: rotate(-45deg); box-shadow: 0 0 0 1px #171b1e; }
+.visibility-toggle.off > span::after { display: none; }
+.layer-row.bound .group-copy em { color: #79c8ce; font-style: normal; }
 .group-row { width: 100%; height: 48px; display: grid; grid-template-columns: 14px 28px minmax(0,1fr); align-items: center; gap: 7px; padding: 0 8px 0 calc(7px + var(--depth) * 12px); border: 1px solid transparent; background: transparent; text-align: left; cursor: pointer; }
 .group-row:hover { background: #1d2226; }
 .group-row.selected { border-color: #695938; background: #29251d; }
@@ -134,6 +154,7 @@ h2 { margin: 2px 0 0; font-size: 16px; font-weight: 600; letter-spacing: .04em; 
 .tool-rotate .svg-host [data-studio-group] { cursor: alias; }
 .tool-scale .svg-host [data-studio-group] { cursor: nwse-resize; }
 .svg-host [data-selected="true"] > g { filter: drop-shadow(0 0 1.5px #ef6247) drop-shadow(0 0 1.5px #ef6247); }
+.rig-mode .svg-host [data-bone-bound="true"] > g { filter: drop-shadow(0 0 1px #08292d) drop-shadow(0 0 2.2px #67d8e2) drop-shadow(0 0 2.2px #67d8e2); }
 .rig-mode .svg-host { cursor: default; }
 .rig-mode .svg-host [data-studio-group] { cursor: default; }
 .rig-overlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: auto; }

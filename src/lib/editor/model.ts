@@ -42,6 +42,7 @@ export type Pose = {
   name: string;
   transforms: Record<string, GroupTransform>;
   boneTransforms: Record<string, BonePoseTransform>;
+  visibility: Record<string, boolean>;
 };
 
 export const identityTransform = (): GroupTransform => ({
@@ -98,6 +99,7 @@ export function createPose(
   name: string,
   transforms: Record<string, GroupTransform> = {},
   boneTransforms: Record<string, BonePoseTransform> = {},
+  visibility: Record<string, boolean> = {},
 ): Pose {
   return {
     id: crypto.randomUUID(),
@@ -106,5 +108,6 @@ export function createPose(
     boneTransforms: Object.fromEntries(
       Object.entries(boneTransforms).map(([key, value]) => [key, { ...value }]),
     ),
+    visibility: { ...visibility },
   };
 }

@@ -167,6 +167,8 @@ export function serializeForExport(host: HTMLElement): string {
   for (const element of Array.from(clone.querySelectorAll("[data-studio-group]"))) {
     element.removeAttribute("data-studio-group");
     element.removeAttribute("data-selected");
+    element.removeAttribute("data-bone-bound");
+    element.removeAttribute("data-pose-hidden");
   }
   return new XMLSerializer().serializeToString(clone);
 }
@@ -175,6 +177,26 @@ export function setWrapperMatrix(host: HTMLElement, key: string, matrix: number[
   const wrapper = host.querySelector(`[data-studio-group="${CSS.escape(key)}"]`);
   if (!wrapper) return;
   wrapper.setAttribute("transform", `matrix(${matrix.map((value) => value.toFixed(6)).join(" ")})`);
+}
+
+export function setWrapperVisibility(host: HTMLElement, key: string, visible: boolean) {
+  const wrapper = host.querySelector(`[data-studio-group="${CSS.escape(key)}"]`);
+  if (!wrapper) return;
+  if (visible) {
+    wrapper.removeAttribute("visibility");
+    wrapper.removeAttribute("data-pose-hidden");
+  } else {
+    wrapper.setAttribute("visibility", "hidden");
+    wrapper.setAttribute("data-pose-hidden", "true");
+  }
+}
+
+export function highlightBoneWrapper(host: HTMLElement, key: string | null) {
+  for (const wrapper of Array.from(host.querySelectorAll("[data-bone-bound]"))) {
+    wrapper.removeAttribute("data-bone-bound");
+  }
+  if (!key) return;
+  host.querySelector(`[data-studio-group="${CSS.escape(key)}"]`)?.setAttribute("data-bone-bound", "true");
 }
 
 export function selectWrapper(host: HTMLElement, key: string | null) {
