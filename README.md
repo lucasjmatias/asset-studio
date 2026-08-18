@@ -36,7 +36,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 5. Resize can use **Lock ratio**, free two-axis distortion, or **Keep area**, which inversely scales the second axis to preserve the current pixel area.
 6. Open **Rig**, select a group, and add a root bone. Select a bone before adding the next one to create a parent/child chain. The new child auto-binds to the selected group and points toward its center.
 7. Bones use a unified smart manipulator: drag the middle to move the whole bone, drag an endpoint or its outside orbit to rotate around the opposite endpoint without changing length, and drag the endpoint ring to resize along the bone axis. The cursor changes to four arrows, curved arrows, or aligned two-way arrows for each zone.
-8. **Setup** and **Pose** show the exact same guide placement. Use Setup to arrange the guides while the artwork stays frozen, then switch to Pose without a skeleton jump so descendants and bound groups follow those guides.
+8. **Setup** and **Pose** show the exact same guide placement. Setup is stored as the global rig baseline while every pose stores only its own delta. Arrange guides in Setup with the artwork frozen, then switch to Pose without a skeleton jump or accidental deformation.
    Bone pivots are kept in SVG-root space, so bound groups nested below source `translate`, `rotate`, or non-uniform `scale` transforms still rotate around the visible bone endpoint.
 9. Create or duplicate more poses. Every pose owns independent group and bone transforms.
 10. Set the pixel resolution, then choose **Fit ratio · centered** or **Stretch to output**.

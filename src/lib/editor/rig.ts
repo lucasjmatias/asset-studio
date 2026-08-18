@@ -105,8 +105,9 @@ export function boneWorldMap(
 export function boneGroupMatrices(
   bones: Bone[],
   transforms: Record<string, BonePoseTransform> = {},
+  restTransforms: Record<string, BonePoseTransform> = {},
 ): Record<string, Matrix> {
-  const rest = boneWorldMap(bones);
+  const rest = boneWorldMap(bones, restTransforms);
   const posed = boneWorldMap(bones, transforms);
   const matrices: Record<string, Matrix> = {};
   for (const bone of bones) {

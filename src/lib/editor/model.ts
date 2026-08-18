@@ -62,6 +62,26 @@ export const identityBoneTransform = (): BonePoseTransform => ({
   scaleY: 1,
 });
 
+export function composeBoneTransform(setup: BonePoseTransform, pose: BonePoseTransform): BonePoseTransform {
+  return {
+    x: setup.x + pose.x,
+    y: setup.y + pose.y,
+    rotation: setup.rotation + pose.rotation,
+    scaleX: setup.scaleX * pose.scaleX,
+    scaleY: setup.scaleY * pose.scaleY,
+  };
+}
+
+export function relativeBoneTransform(effective: BonePoseTransform, setup: BonePoseTransform): BonePoseTransform {
+  return {
+    x: effective.x - setup.x,
+    y: effective.y - setup.y,
+    rotation: effective.rotation - setup.rotation,
+    scaleX: effective.scaleX / Math.max(0.02, setup.scaleX),
+    scaleY: effective.scaleY / Math.max(0.02, setup.scaleY),
+  };
+}
+
 export function cloneTransform(transform: GroupTransform): GroupTransform {
   return { ...transform };
 }

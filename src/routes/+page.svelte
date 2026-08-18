@@ -4,7 +4,7 @@
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { readTextFile } from "@tauri-apps/plugin-fs";
   import initStudioCore, { transform_matrix } from "$lib/wasm/studio_core.js";
-  import { createPose, identityBoneTransform, identityTransform, type Bone, type BonePoseTransform, type GroupTransform, type PixelResizeMode, type Pose, type SvgGroup } from "$lib/editor/model";
+  import { composeBoneTransform, createPose, identityBoneTransform, identityTransform, relativeBoneTransform, type Bone, type BonePoseTransform, type GroupTransform, type PixelResizeMode, type Pose, type SvgGroup } from "$lib/editor/model";
   import { prepareSvg, selectWrapper, serializeForExport, setWrapperMatrix } from "$lib/editor/svg";
   import { loadCanvasKit, rasterizeSvg, renderEncodedPixelPreview, renderPixelPreview } from "$lib/editor/pixel-preview";
   import { boneDepth, boneGroupMatrices, boneWorldMap, invertMatrix, matrixInParentSpace, multiplyMatrix, wouldCreateCycle, type Matrix } from "$lib/editor/rig";
@@ -14,9 +14,9 @@
   type RigEditMode = "setup" | "pose";
   type BoneGesture = "move" | "rotate-start" | "rotate-end" | "scale-start" | "scale-end";
   type PrimaryView = "vector" | "rig";
-  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number };
+  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number };
   type DragState = { pointerId: number; key: string; startPoint: DOMPoint; startTransform: GroupTransform; inverse: DOMMatrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number };
-  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; startBone: Bone; startPose: BonePoseTransform; parentInverse: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number } };
+  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number } };
 
   const cursorSvg = (body: string, fallback: string, angle = 0) => `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><g transform="rotate(${angle} 16 16)" fill="none" stroke="#f4c96d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="#101416" stroke-width="4" d="${body}"/><path d="${body}"/></g></svg>`)}") 16 16, ${fallback}`;
   const moveCursor = cursorSvg("M16 3l-4 4m4-4l4 4M16 29l-4-4m4 4l4-4M3 16l4-4m-4 4l4 4M29 16l-4-4m4 4l-4 4M16 4v24M4 16h24", "move");
@@ -34,6 +34,7 @@
   let groups = $state<SvgGroup[]>([]);
   let poses = $state<Pose[]>([]);
   let bones = $state<Bone[]>([]);
+  let setupBoneTransforms = $state<Record<string, BonePoseTransform>>({});
   let activePoseId = $state("rest");
   let selectedGroupKey = $state<string | null>(null);
   let selectedBoneId = $state<string | null>(null);
@@ -75,7 +76,7 @@
   const selectedBone = $derived(bones.find((bone) => bone.id === selectedBoneId) ?? null);
   // Setup and Pose share the same visible guide placement. The mode only
   // decides whether the artwork is frozen or follows those guides.
-  const boneWorlds = $derived(boneWorldMap(bones, activePose?.boneTransforms ?? {}));
+  const boneWorlds = $derived(boneWorldMap(bones, effectiveBoneTransforms(activePose)));
   const renderedBones = $derived([...bones].sort((left, right) => Number(left.id === selectedBoneId) - Number(right.id === selectedBoneId)));
   const canEdit = $derived(Boolean(sourceSvg && activePose));
   const frameCount = $derived(poses.length + 1);
@@ -94,7 +95,7 @@
     try {
       const session = JSON.parse(cached) as Session;
       await loadSvgSource(session.sourceSvg, session.fileName, false);
-      poses = (session.poses ?? []).map((pose) => {
+      const restoredPoses = (session.poses ?? []).map((pose) => {
         const legacy = pose as Pose & { boneRotations?: Record<string, number> };
         const migrated = legacy.boneTransforms ?? Object.fromEntries(
           Object.entries(legacy.boneRotations ?? {}).map(([id, rotation]) => [id, { ...identityBoneTransform(), rotation }]),
@@ -102,7 +103,23 @@
         return { ...pose, boneTransforms: migrated };
       });
       bones = session.bones ?? [];
-      activePoseId = poses.some((pose) => pose.id === session.activePoseId) ? session.activePoseId : "rest";
+      const restoredActivePoseId = restoredPoses.some((pose) => pose.id === session.activePoseId) ? session.activePoseId : "rest";
+      if (session.rigTransformModel === 2) {
+        setupBoneTransforms = session.setupBoneTransforms ?? {};
+        poses = restoredPoses;
+      } else {
+        const baseline = restoredPoses.find((pose) => pose.id === restoredActivePoseId)?.boneTransforms ?? {};
+        setupBoneTransforms = Object.fromEntries(Object.entries(baseline).map(([id, transform]) => [id, { ...transform }]));
+        poses = restoredPoses.map((pose) => ({
+          ...pose,
+          boneTransforms: Object.fromEntries(bones.flatMap((bone) => {
+            const relative = relativeBoneTransform(pose.boneTransforms?.[bone.id] ?? identityBoneTransform(), baseline[bone.id] ?? identityBoneTransform());
+            const isIdentity = Math.abs(relative.x) < 1e-8 && Math.abs(relative.y) < 1e-8 && Math.abs(relative.rotation) < 1e-8 && Math.abs(relative.scaleX - 1) < 1e-8 && Math.abs(relative.scaleY - 1) < 1e-8;
+            return isIdentity ? [] : [[bone.id, relative]];
+          })),
+        }));
+      }
+      activePoseId = restoredActivePoseId;
       outputWidth = session.outputWidth || 64;
       outputHeight = session.outputHeight || 64;
       antiAlias = Number.isFinite(session.antiAlias) ? session.antiAlias : 0;
@@ -116,6 +133,7 @@
       playbackFps = [1, 2, 4, 8].includes(session.playbackFps || 0) ? session.playbackFps! : 2;
       requestAnimationFrame(() => { if (rigEditMode === "setup") setupFrozenMatrices = calculatedGroupMatrices(); applyAllTransforms(); });
       status = `Restored ${session.fileName}`;
+      schedulePersist();
     } catch (error) { console.warn("Unable to restore prior session", error); }
   });
 
@@ -141,7 +159,7 @@
     return [a, b, c, d, transform.x + transform.pivotX - a * transform.pivotX - c * transform.pivotY, transform.y + transform.pivotY - b * transform.pivotX - d * transform.pivotY];
   }
   function calculatedGroupMatricesFor(pose: Pose | null): Record<string, Matrix> {
-    const rigMatrices = boneGroupMatrices(bones, pose?.boneTransforms ?? {});
+    const rigMatrices = boneGroupMatrices(bones, effectiveBoneTransforms(pose), setupBoneTransforms);
     return Object.fromEntries(groups.map((group) => {
       const direct = matrixFor(transformForPose(group.key, pose)) as Matrix;
       const parentRest = wrapperParentMatrices[group.key] ?? [1, 0, 0, 1, 0, 0];
@@ -217,7 +235,7 @@
   async function loadSvgSource(svg: string, name: string, persist = true) {
     const prepared = prepareSvg(svg);
     sourceSvg = svg; fileName = name; groups = prepared.groups; warnings = prepared.warnings; viewBox = prepared.viewBox;
-    selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; poses = []; bones = []; activePoseId = "rest";
+    selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; poses = []; bones = []; setupBoneTransforms = {}; activePoseId = "rest";
     svgHost.innerHTML = prepared.markup;
     requestAnimationFrame(() => { collectPivots(); applyAllTransforms(); });
     status = `${groups.length} editable group${groups.length === 1 ? "" : "s"} indexed`;
@@ -380,11 +398,25 @@
       for (const bone of bones) if (bone.parentId && removed.has(bone.parentId) && !removed.has(bone.id)) { removed.add(bone.id); changed = true; }
     }
     bones = bones.filter((bone) => !removed.has(bone.id));
+    setupBoneTransforms = Object.fromEntries(Object.entries(setupBoneTransforms).filter(([id]) => !removed.has(id)));
     poses = poses.map((pose) => ({ ...pose, boneTransforms: Object.fromEntries(Object.entries(pose.boneTransforms ?? {}).filter(([id]) => !removed.has(id))) }));
     selectedBoneId = null; applyAllTransforms(); schedulePersist();
     status = `${removed.size} bone${removed.size === 1 ? "" : "s"} removed`;
   }
+  function currentSetupBoneTransform(id: string): BonePoseTransform { return setupBoneTransforms[id] ?? identityBoneTransform(); }
   function currentBoneTransform(id: string): BonePoseTransform { return activePose?.boneTransforms[id] ?? identityBoneTransform(); }
+  function effectiveBoneTransform(id: string, pose: Pose | null = activePose): BonePoseTransform {
+    return composeBoneTransform(currentSetupBoneTransform(id), pose?.boneTransforms[id] ?? identityBoneTransform());
+  }
+  function effectiveBoneTransforms(pose: Pose | null): Record<string, BonePoseTransform> {
+    return Object.fromEntries(bones.map((bone) => [bone.id, effectiveBoneTransform(bone.id, pose)]));
+  }
+  function updateSetupBoneTransform(id: string, transform: BonePoseTransform, preview = true) {
+    setupBoneTransforms = { ...setupBoneTransforms, [id]: { ...transform } };
+    applyAllTransforms(); dirty = true;
+    if (preview) schedulePreview();
+    schedulePersist();
+  }
   function updateBonePose(id: string, transform: BonePoseTransform, preview = true) {
     if (!activePose) return;
     poses = poses.map((pose) => pose.id === activePose.id ? { ...pose, boneTransforms: { ...(pose.boneTransforms ?? {}), [id]: { ...transform } } } : pose);
@@ -393,18 +425,25 @@
     schedulePersist();
   }
   function changeBoneRotation(event: Event) {
-    if (!selectedBone || !activePose) return;
+    if (!selectedBone || (rigEditMode === "pose" && !activePose)) return;
     const rotation = Number((event.currentTarget as HTMLInputElement).value);
-    if (Number.isFinite(rotation)) updateBonePose(selectedBone.id, { ...currentBoneTransform(selectedBone.id), rotation });
+    if (!Number.isFinite(rotation)) return;
+    if (rigEditMode === "setup") updateSetupBoneTransform(selectedBone.id, { ...currentSetupBoneTransform(selectedBone.id), rotation });
+    else updateBonePose(selectedBone.id, { ...currentBoneTransform(selectedBone.id), rotation });
   }
   function resetBoneRotation() {
-    if (selectedBone && activePose) updateBonePose(selectedBone.id, identityBoneTransform());
+    if (!selectedBone) return;
+    if (rigEditMode === "setup") updateSetupBoneTransform(selectedBone.id, identityBoneTransform());
+    else if (activePose) updateBonePose(selectedBone.id, identityBoneTransform());
   }
   function changeBonePoseNumber(field: keyof BonePoseTransform, event: Event) {
-    if (!selectedBone || !activePose) return;
+    if (!selectedBone || (rigEditMode === "pose" && !activePose)) return;
     const value = Number((event.currentTarget as HTMLInputElement).value);
     if (!Number.isFinite(value)) return;
-    updateBonePose(selectedBone.id, { ...currentBoneTransform(selectedBone.id), [field]: field.startsWith("scale") ? Math.max(0.02, value) : value });
+    const current = rigEditMode === "setup" ? currentSetupBoneTransform(selectedBone.id) : currentBoneTransform(selectedBone.id);
+    const next = { ...current, [field]: field.startsWith("scale") ? Math.max(0.02, value) : value };
+    if (rigEditMode === "setup") updateSetupBoneTransform(selectedBone.id, next);
+    else updateBonePose(selectedBone.id, next);
   }
   function pointWithMatrix(matrix: Matrix, x: number, y: number) {
     return { x: matrix[0] * x + matrix[2] * y + matrix[4], y: matrix[1] * x + matrix[3] * y + matrix[5] };
@@ -426,25 +465,22 @@
     const localDy = localEnd.y - localStart.y;
     const localLength = Math.max(1, Math.hypot(localDx, localDy));
     const localAngle = Math.atan2(localDy, localDx) * 180 / Math.PI;
-    if (rigEditMode === "setup" && !activePose) {
-      updateBone({ ...state.startBone, x: localStart.x, y: localStart.y, restRotation: localAngle, length: localLength });
-      return;
-    }
     const scaleX = Math.max(0.02, localLength / Math.max(1, state.startBone.length));
-    let scaleY = state.startPose.scaleY;
+    let scaleY = state.startEffective.scaleY;
     if (state.gesture.startsWith("scale")) {
-      const factor = scaleX / Math.max(0.02, state.startPose.scaleX);
-      if (preserveArea) scaleY = state.startPose.scaleY / Math.max(0.02, factor);
-      else if (lockRatio) scaleY = state.startPose.scaleY * factor;
+      const factor = scaleX / Math.max(0.02, state.startEffective.scaleX);
+      if (preserveArea) scaleY = state.startEffective.scaleY / Math.max(0.02, factor);
+      else if (lockRatio) scaleY = state.startEffective.scaleY * factor;
     }
-    updateBonePose(state.boneId, {
-      ...state.startPose,
+    const effective: BonePoseTransform = {
       x: localStart.x - state.startBone.x,
       y: localStart.y - state.startBone.y,
       rotation: localAngle - state.startBone.restRotation,
       scaleX,
       scaleY,
-    }, false);
+    };
+    if (rigEditMode === "setup") updateSetupBoneTransform(state.boneId, relativeBoneTransform(effective, state.startPose), false);
+    else updateBonePose(state.boneId, relativeBoneTransform(effective, state.startSetup), false);
   }
   function bonePointerDown(event: PointerEvent, boneId: string, gesture: BoneGesture) {
     selectBone(boneId);
@@ -463,7 +499,9 @@
       inverse,
       startPoint,
       startBone: { ...bone },
+      startSetup: { ...currentSetupBoneTransform(boneId) },
       startPose: { ...currentBoneTransform(boneId) },
+      startEffective: { ...effectiveBoneTransform(boneId) },
       parentInverse: parentMatrix ? invertMatrix(parentMatrix) : [1, 0, 0, 1, 0, 0],
       startWorld: { startX: world.startX, startY: world.startY, endX: world.endX, endY: world.endY },
     };
@@ -560,12 +598,12 @@
     const amount = event.shiftKey ? 10 : 1;
     if (viewMode === "rig" && selectedBone) {
       if (rigEditMode === "setup") {
-        const next = { ...selectedBone };
+        const next = { ...currentSetupBoneTransform(selectedBone.id) };
         if (event.key === "ArrowLeft") next.x -= amount;
         if (event.key === "ArrowRight") next.x += amount;
         if (event.key === "ArrowUp") next.y -= amount;
         if (event.key === "ArrowDown") next.y += amount;
-        updateBone(next);
+        updateSetupBoneTransform(selectedBone.id, next);
       } else if (activePose) {
         const next = { ...currentBoneTransform(selectedBone.id) };
         if (event.key === "ArrowLeft") next.x -= amount;
@@ -614,7 +652,7 @@
   }
   function schedulePersist() {
     if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, aiPixelFilter, aiPaletteSize, primaryView: viewMode, pixelVisible, playbackFps } satisfies Session)), 250);
+    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, aiPixelFilter, aiPaletteSize, primaryView: viewMode, pixelVisible, playbackFps } satisfies Session)), 250);
   }
   async function exportPngInBrowser(svg: string, name: string) {
     try {
@@ -783,15 +821,16 @@
     </section>
 
     <aside class="panel inspector-panel">
-      <div class="panel-heading"><div><span class="eyebrow">SELECTION</span><h2>{viewMode === "rig" ? "Bone" : "Transform"}</h2></div>{#if viewMode === "rig"}<button class="reset" disabled={!activePose || !selectedBone} onclick={resetBoneRotation}>{rigEditMode === "setup" ? "RESET PLACEMENT" : "ZERO POSE"}</button>{:else}<button class="reset" disabled={!canEdit || !selectedGroupKey} onclick={resetSelected}>RESET</button>{/if}</div>
+      <div class="panel-heading"><div><span class="eyebrow">SELECTION</span><h2>{viewMode === "rig" ? "Bone" : "Transform"}</h2></div>{#if viewMode === "rig"}<button class="reset" disabled={!selectedBone || (rigEditMode === "pose" && !activePose)} onclick={resetBoneRotation}>{rigEditMode === "setup" ? "RESET PLACEMENT" : "ZERO POSE"}</button>{:else}<button class="reset" disabled={!canEdit || !selectedGroupKey} onclick={resetSelected}>RESET</button>{/if}</div>
       {#if viewMode === "rig" && selectedBone}
         <div class="selection-card"><span class="selection-chip bone-chip">B</span><div><small>ACTIVE BONE · {rigEditMode === "setup" ? "SETUP" : "POSE"}</small><strong>{selectedBone.name}</strong></div></div>
         <div class:follow={rigEditMode === "pose"} class="rig-behavior-note"><span>{rigEditMode === "setup" ? "01" : "02"}</span><div><strong>{rigEditMode === "setup" ? "Artwork frozen · guides live" : "Artwork follows the same guides"}</strong><small>{rigEditMode === "setup" ? "Arrange the guide placement freely. Switching to Pose keeps every bone exactly where you put it." : "The guide does not jump when modes change; bound groups now follow its current placement."}</small></div></div>
         <div class="control-section" class:disabled={rigEditMode !== "setup"}><div class="section-label"><span>IDENTITY</span><small>RIG DATA</small></div><label class="wide-control text-control"><span>N</span><input disabled={rigEditMode !== "setup"} value={selectedBone.name} onchange={changeBoneName} /></label></div>
         <div class="control-section" class:disabled={rigEditMode !== "setup"}><div class="section-label"><span>HIERARCHY</span><small>PARENT → CHILD</small></div><label class="select-control"><span>P</span><select disabled={rigEditMode !== "setup"} value={selectedBone.parentId ?? ""} onchange={changeBoneParent}><option value="">ROOT</option>{#each bones.filter((bone) => bone.id !== selectedBone.id && !wouldCreateCycle(selectedBone.id, bone.id, bones)) as bone}<option value={bone.id}>{bone.name}</option>{/each}</select></label><label class="select-control"><span>G</span><select disabled={rigEditMode !== "setup"} value={selectedBone.groupKey ?? ""} onchange={changeBoneBinding}><option value="">GUIDE ONLY</option>{#each groups as group}<option value={group.key}>{group.label}</option>{/each}</select></label></div>
         <div class="control-section" class:disabled={rigEditMode !== "setup"}><div class="section-label"><span>BASE BONE</span><small>GLOBAL RIG</small></div><div class="control-grid"><label><span>X</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.x.toFixed(2)} oninput={(event) => changeBoneNumber("x", event)} /></label><label><span>Y</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.y.toFixed(2)} oninput={(event) => changeBoneNumber("y", event)} /></label></div><div class="control-grid second-row"><label><span>L</span><input disabled={rigEditMode !== "setup"} type="number" min="1" step="1" value={selectedBone.length.toFixed(2)} oninput={(event) => changeBoneNumber("length", event)} /></label><label><span>R</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.restRotation.toFixed(2)} oninput={(event) => changeBoneNumber("restRotation", event)} /></label></div></div>
-        {@const bonePose = currentBoneTransform(selectedBone.id)}
-        <div class="control-section" class:disabled={!activePose}><div class="section-label"><span>{rigEditMode === "setup" ? "GUIDE PLACEMENT" : "POSE TRANSFORM"}</span><small>NON-DESTRUCTIVE</small></div><div class="control-grid"><label><span>X</span><input disabled={!activePose} type="number" step="1" value={bonePose.x.toFixed(2)} oninput={(event) => changeBonePoseNumber("x", event)} /></label><label><span>Y</span><input disabled={!activePose} type="number" step="1" value={bonePose.y.toFixed(2)} oninput={(event) => changeBonePoseNumber("y", event)} /></label></div><label class="wide-control second-row"><span>R</span><input disabled={!activePose} type="number" step="1" value={bonePose.rotation.toFixed(2)} oninput={changeBoneRotation} /></label><div class="control-grid second-row"><label><span>W</span><input disabled={!activePose} type="number" min="0.02" step="0.05" value={bonePose.scaleX.toFixed(3)} oninput={(event) => changeBonePoseNumber("scaleX", event)} /></label><label><span>H</span><input disabled={!activePose} type="number" min="0.02" step="0.05" value={bonePose.scaleY.toFixed(3)} oninput={(event) => changeBonePoseNumber("scaleY", event)} /></label></div></div>
+        {@const bonePose = rigEditMode === "setup" ? currentSetupBoneTransform(selectedBone.id) : currentBoneTransform(selectedBone.id)}
+        {@const boneControlsDisabled = rigEditMode === "pose" && !activePose}
+        <div class="control-section" class:disabled={boneControlsDisabled}><div class="section-label"><span>{rigEditMode === "setup" ? "GUIDE PLACEMENT" : "POSE TRANSFORM"}</span><small>NON-DESTRUCTIVE</small></div><div class="control-grid"><label><span>X</span><input disabled={boneControlsDisabled} type="number" step="1" value={bonePose.x.toFixed(2)} oninput={(event) => changeBonePoseNumber("x", event)} /></label><label><span>Y</span><input disabled={boneControlsDisabled} type="number" step="1" value={bonePose.y.toFixed(2)} oninput={(event) => changeBonePoseNumber("y", event)} /></label></div><label class="wide-control second-row"><span>R</span><input disabled={boneControlsDisabled} type="number" step="1" value={bonePose.rotation.toFixed(2)} oninput={changeBoneRotation} /></label><div class="control-grid second-row"><label><span>W</span><input disabled={boneControlsDisabled} type="number" min="0.02" step="0.05" value={bonePose.scaleX.toFixed(3)} oninput={(event) => changeBonePoseNumber("scaleX", event)} /></label><label><span>H</span><input disabled={boneControlsDisabled} type="number" min="0.02" step="0.05" value={bonePose.scaleY.toFixed(3)} oninput={(event) => changeBonePoseNumber("scaleY", event)} /></label></div></div>
         <div class="danger-zone"><button disabled={rigEditMode !== "setup"} onclick={deleteBone}>DELETE BONE + CHILDREN</button></div>
       {:else if selectedGroup}
         <div class="selection-card"><span class="selection-chip">G</span><div><small>ACTIVE GROUP</small><strong>{selectedGroup.label}</strong></div></div>
