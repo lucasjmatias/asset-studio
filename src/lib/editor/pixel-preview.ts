@@ -69,6 +69,28 @@ function renderFallback(source: HTMLCanvasElement, target: HTMLCanvasElement) {
   context.drawImage(source, Math.floor((target.width - width) / 2), Math.floor((target.height - height) / 2), width, height);
 }
 
+export async function renderEncodedPixelPreview(
+  png: Uint8Array,
+  target: HTMLCanvasElement,
+  pixelWidth: number,
+  pixelHeight: number,
+): Promise<void> {
+  const bitmap = await createImageBitmap(new Blob([png], { type: "image/png" }));
+  const displayWidth = Math.max(1, Math.round(target.clientWidth * devicePixelRatio));
+  const displayHeight = Math.max(1, Math.round(target.clientHeight * devicePixelRatio));
+  target.width = displayWidth;
+  target.height = displayHeight;
+  const context = target.getContext("2d");
+  if (!context) throw new Error("Unable to present the refined pixel preview.");
+  context.clearRect(0, 0, displayWidth, displayHeight);
+  context.imageSmoothingEnabled = false;
+  const scale = Math.max(1, Math.floor(Math.min(displayWidth / pixelWidth, displayHeight / pixelHeight)));
+  const width = pixelWidth * scale;
+  const height = pixelHeight * scale;
+  context.drawImage(bitmap, Math.floor((displayWidth - width) / 2), Math.floor((displayHeight - height) / 2), width, height);
+  bitmap.close();
+}
+
 export async function renderPixelPreview(
   svg: string,
   width: number,

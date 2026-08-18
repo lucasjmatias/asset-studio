@@ -37,6 +37,16 @@ export function invertMatrix(matrix: Matrix): Matrix {
   ];
 }
 
+/**
+ * Express a transform authored in the SVG root coordinate system in the
+ * coordinate system of a wrapper's parent. This keeps a root-space pivot
+ * (for example, the fixed end of a bone) fixed even when the source group is
+ * nested below translated, rotated, or scaled SVG groups.
+ */
+export function matrixInParentSpace(rootTransform: Matrix, parentToRoot: Matrix): Matrix {
+  return multiplyMatrix(multiplyMatrix(invertMatrix(parentToRoot), rootTransform), parentToRoot);
+}
+
 function localMatrix(x: number, y: number, degrees: number): Matrix {
   const radians = degrees * Math.PI / 180;
   const cosine = Math.cos(radians);
