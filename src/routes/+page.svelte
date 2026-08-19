@@ -2,22 +2,23 @@
   import { onDestroy, onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { open, save } from "@tauri-apps/plugin-dialog";
-  import { readTextFile } from "@tauri-apps/plugin-fs";
+  import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
   import initStudioCore, { transform_matrix } from "$lib/wasm/studio_core.js";
   import { composeBoneTransform, createPose, identityBoneTransform, identityTransform, relativeBoneTransform, type Bone, type BonePoseTransform, type GroupTransform, type PixelResizeMode, type Pose, type SvgGroup } from "$lib/editor/model";
   import { highlightBoneWrapper, prepareSvg, selectWrapper, serializeForExport, setWrapperMatrix, setWrapperVisibility } from "$lib/editor/svg";
   import { loadCanvasKit, rasterizeSvg, renderEncodedPixelPreview, renderPixelPreview } from "$lib/editor/pixel-preview";
-  import { boneDepth, boneGroupMatrices, boneWorldMap, invertMatrix, matrixInParentSpace, multiplyMatrix, wouldCreateCycle, type Matrix } from "$lib/editor/rig";
+  import { boneDepth, boneGroupMatrices, boneWorldMap, composeGroupLocalMatrices, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, translateBoneEndpoints, wouldCreateCycle, type Matrix } from "$lib/editor/rig";
   import { appendHistory, cloneSerializable, snapshotsEqual, type HistoryEntry } from "$lib/editor/history";
+  import { decodeAstdProject, encodeAstdProject, type AstdProjectState } from "$lib/editor/project";
   import "./studio.css";
 
   type EditorTool = "move" | "rotate" | "scale";
   type RigEditMode = "setup" | "pose";
   type BoneGesture = "move" | "rotate-start" | "rotate-end" | "scale-start" | "scale-end";
   type PrimaryView = "vector" | "rig";
-  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number };
+  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; preferredRigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number };
   type DocumentSnapshot = { poses: Pose[]; bones: Bone[]; setupBoneTransforms: Record<string, BonePoseTransform>; activePoseId: string; selectedGroupKey: string | null; selectedBoneId: string | null };
-  type DragState = { pointerId: number; key: string; startPoint: DOMPoint; startTransform: GroupTransform; inverse: DOMMatrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number; historyBefore: DocumentSnapshot };
+  type DragState = { pointerId: number; key: string; startPoint: { x: number; y: number }; startTransform: GroupTransform; inverse: DOMMatrix; rootToTool: Matrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number; historyBefore: DocumentSnapshot };
   type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; historyBefore: DocumentSnapshot };
 
   const cursorSvg = (body: string, fallback: string, angle = 0) => `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><g transform="rotate(${angle} 16 16)" fill="none" stroke="#f4c96d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="#101416" stroke-width="4" d="${body}"/><path d="${body}"/></g></svg>`)}") 16 16, ${fallback}`;
@@ -31,6 +32,7 @@
   let previewCanvas: HTMLCanvasElement;
   let rigSvg = $state<SVGSVGElement>();
   let fileInput: HTMLInputElement;
+  let projectFileInput: HTMLInputElement;
   let sourceSvg = $state("");
   let fileName = $state("No source loaded");
   let groups = $state<SvgGroup[]>([]);
@@ -50,6 +52,7 @@
   let lockRatio = $state(true);
   let preserveArea = $state(false);
   let rigEditMode = $state<RigEditMode>("setup");
+  let preferredRigEditMode = $state<RigEditMode>("setup");
   let viewMode = $state<PrimaryView | null>("vector");
   let pixelVisible = $state(false);
   let leftMode = $state<"groups" | "rig">("groups");
@@ -61,6 +64,7 @@
   let wasmReady = $state(false);
   let desktopRuntime = $state(false);
   let dirty = $state(false);
+  let projectPath = $state<string | null>(null);
   let isPlaying = $state(false);
   let playbackFps = $state(2);
   let playbackTimer: ReturnType<typeof setTimeout> | null = null;
@@ -83,7 +87,8 @@
   const boneWorlds = $derived(boneWorldMap(bones, effectiveBoneTransforms(activePose)));
   const renderedBones = $derived([...bones].sort((left, right) => Number(left.id === selectedBoneId) - Number(right.id === selectedBoneId)));
   const canEdit = $derived(Boolean(sourceSvg && activePose));
-  const frameCount = $derived(poses.length + 1);
+  const frameCount = $derived(poses.length);
+  const projectName = $derived(projectPath?.split(/[\\/]/).pop() ?? "UNSAVED .ASTD");
 
   onMount(async () => {
     desktopRuntime = isTauri();
@@ -130,7 +135,8 @@
       resizeMode = session.resizeMode === "stretch" ? "stretch" : "contain";
       aiPixelFilter = session.aiPixelFilter === true;
       aiPaletteSize = Math.max(2, Math.min(64, session.aiPaletteSize || 16));
-      rigEditMode = session.rigEditMode === "pose" ? "pose" : "setup";
+      preferredRigEditMode = session.preferredRigEditMode === "pose" || session.rigEditMode === "pose" ? "pose" : "setup";
+      rigEditMode = restoredActivePoseId === "rest" ? "setup" : preferredRigEditMode;
       viewMode = session.primaryView === "rig" || session.primaryView === null ? session.primaryView : "vector";
       pixelVisible = session.pixelVisible === true;
       if (!viewMode && !pixelVisible) viewMode = "vector";
@@ -156,6 +162,7 @@
     if (snapshotsEqual(before, after)) return;
     undoStack = appendHistory(undoStack, { label, before, after });
     redoStack = [];
+    dirty = true;
   }
   function restoreDocument(snapshot: DocumentSnapshot) {
     const restored = cloneSerializable(snapshot);
@@ -165,7 +172,7 @@
     activePoseId = poses.some((pose) => pose.id === snapshot.activePoseId) ? snapshot.activePoseId : "rest";
     selectedGroupKey = groups.some((group) => group.key === snapshot.selectedGroupKey) ? snapshot.selectedGroupKey : null;
     selectedBoneId = bones.some((bone) => bone.id === snapshot.selectedBoneId) ? snapshot.selectedBoneId : null;
-    if (activePoseId === "rest" && rigEditMode === "pose") rigEditMode = "setup";
+    rigEditMode = activePoseId === "rest" ? "setup" : preferredRigEditMode;
     if (rigEditMode === "setup") setupFrozenMatrices = calculatedGroupMatrices();
     applyAllTransforms(); dirty = true; schedulePersist();
   }
@@ -206,12 +213,8 @@
   }
   function calculatedGroupMatricesFor(pose: Pose | null): Record<string, Matrix> {
     const rigMatrices = boneGroupMatrices(bones, effectiveBoneTransforms(pose), setupBoneTransforms);
-    return Object.fromEntries(groups.map((group) => {
-      const direct = matrixFor(transformForPose(group.key, pose)) as Matrix;
-      const parentRest = wrapperParentMatrices[group.key] ?? [1, 0, 0, 1, 0, 0];
-      const rigLocal = rigMatrices[group.key] ? matrixInParentSpace(rigMatrices[group.key], parentRest) : null;
-      return [group.key, rigLocal ? multiplyMatrix(rigLocal, direct) : direct];
-    }));
+    const directMatrices = Object.fromEntries(groups.map((group) => [group.key, matrixFor(transformForPose(group.key, pose)) as Matrix]));
+    return composeGroupLocalMatrices(groups, wrapperParentMatrices, rigMatrices, directMatrices);
   }
   function calculatedGroupMatrices(): Record<string, Matrix> { return calculatedGroupMatricesFor(activePose); }
   function applyAllTransforms() {
@@ -229,7 +232,7 @@
   function setRigEditMode(mode: RigEditMode) {
     if (mode === "pose" && !activePose) { status = "Create a pose before entering Pose mode."; return; }
     if (mode === "setup") setupFrozenMatrices = calculatedGroupMatrices();
-    rigEditMode = mode; applyAllTransforms(); schedulePersist();
+    preferredRigEditMode = mode; rigEditMode = mode; dirty = true; applyAllTransforms(); schedulePersist();
     status = mode === "setup" ? "Setup: arrange the shared guides while artwork stays frozen" : "Pose: artwork now follows the same guide placement";
   }
   function showRig() {
@@ -285,11 +288,11 @@
   async function loadSvgSource(svg: string, name: string, persist = true) {
     const prepared = prepareSvg(svg);
     sourceSvg = svg; fileName = name; groups = prepared.groups; warnings = prepared.warnings; viewBox = prepared.viewBox;
-    selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; poses = []; bones = []; setupBoneTransforms = {}; activePoseId = "rest"; undoStack = []; redoStack = [];
+    selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; poses = []; bones = []; setupBoneTransforms = {}; activePoseId = "rest"; undoStack = []; redoStack = []; projectPath = null;
     svgHost.innerHTML = prepared.markup;
     requestAnimationFrame(() => { collectPivots(); applyAllTransforms(); });
     status = `${groups.length} editable group${groups.length === 1 ? "" : "s"} indexed`;
-    dirty = false;
+    dirty = persist;
     if (persist) schedulePersist();
   }
   async function openSvg() {
@@ -308,12 +311,99 @@
     catch (error) { status = error instanceof Error ? error.message : String(error); }
     finally { input.value = ""; }
   }
+  function currentProjectState(): AstdProjectState {
+    return {
+      sourceSvg,
+      sourceFileName: fileName,
+      poses,
+      bones,
+      setupBoneTransforms,
+      activePoseId,
+      selectedGroupKey,
+      selectedBoneId,
+      outputWidth: Math.max(1, Math.round(outputWidth)),
+      outputHeight: Math.max(1, Math.round(outputHeight)),
+      antiAlias,
+      resizeMode,
+      aiPixelFilter,
+      aiPaletteSize,
+      preferredRigEditMode,
+      primaryView: viewMode,
+      pixelVisible,
+      playbackFps,
+      zoom,
+    };
+  }
+  async function loadProjectContents(contents: string, pathOrName: string) {
+    const project = decodeAstdProject(contents);
+    const saved = project.state;
+    await loadSvgSource(saved.sourceSvg, saved.sourceFileName, false);
+    poses = saved.poses;
+    bones = saved.bones;
+    setupBoneTransforms = saved.setupBoneTransforms;
+    activePoseId = poses.some((pose) => pose.id === saved.activePoseId) ? saved.activePoseId : "rest";
+    selectedGroupKey = groups.some((group) => group.key === saved.selectedGroupKey) ? saved.selectedGroupKey : groups[0]?.key ?? null;
+    selectedBoneId = bones.some((bone) => bone.id === saved.selectedBoneId) ? saved.selectedBoneId : null;
+    outputWidth = saved.outputWidth; outputHeight = saved.outputHeight; antiAlias = saved.antiAlias; resizeMode = saved.resizeMode;
+    aiPixelFilter = saved.aiPixelFilter; aiPaletteSize = saved.aiPaletteSize;
+    preferredRigEditMode = saved.preferredRigEditMode;
+    rigEditMode = activePoseId === "rest" ? "setup" : preferredRigEditMode;
+    viewMode = saved.primaryView; pixelVisible = saved.pixelVisible;
+    if (!viewMode && !pixelVisible) viewMode = "vector";
+    leftMode = viewMode === "rig" ? "rig" : "groups";
+    playbackFps = saved.playbackFps; zoom = saved.zoom;
+    projectPath = pathOrName; undoStack = []; redoStack = []; dirty = false;
+    requestAnimationFrame(() => {
+      collectPivots();
+      if (rigEditMode === "setup") setupFrozenMatrices = calculatedGroupMatrices();
+      applyAllTransforms();
+    });
+    schedulePersist();
+    status = `Project loaded · ${pathOrName.split(/[\\/]/).pop()}`;
+  }
+  async function openProject() {
+    try {
+      if (isTauri()) {
+        const path = await open({ multiple: false, directory: false, filters: [{ name: "Asset Studio Project", extensions: ["astd"] }] });
+        if (!path) return;
+        await loadProjectContents(await readTextFile(path), path);
+      } else projectFileInput.click();
+    } catch (error) { status = error instanceof Error ? error.message : String(error); }
+  }
+  async function receiveProjectFile(event: Event) {
+    const input = event.currentTarget as HTMLInputElement, file = input.files?.[0];
+    if (!file) return;
+    try { await loadProjectContents(await file.text(), file.name); }
+    catch (error) { status = error instanceof Error ? error.message : String(error); }
+    finally { input.value = ""; }
+  }
+  async function saveProject(saveAs = false) {
+    if (!sourceSvg) return;
+    const contents = encodeAstdProject(currentProjectState());
+    const defaultName = `${fileName.replace(/\.[^.]+$/i, "") || "asset"}.astd`;
+    try {
+      if (isTauri()) {
+        const path = !saveAs && projectPath
+          ? projectPath
+          : await save({ defaultPath: projectPath ?? defaultName, filters: [{ name: "Asset Studio Project", extensions: ["astd"] }] });
+        if (!path) return;
+        await writeTextFile(path, contents);
+        projectPath = path;
+      } else {
+        const blob = new Blob([contents], { type: "application/json" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob); link.download = defaultName; link.click(); URL.revokeObjectURL(link.href);
+        projectPath = defaultName;
+      }
+      dirty = false; status = `Project saved · ${projectName}`; schedulePersist();
+    } catch (error) { status = error instanceof Error ? error.message : String(error); }
+  }
   function selectGroup(key: string) { selectedGroupKey = key; selectWrapper(svgHost, key); }
   function addPose() {
     if (!sourceSvg) return;
     const before = captureDocument();
     const pose = createPose(`Pose ${String(poses.length + 1).padStart(2, "0")}`, activePose?.transforms ?? {}, activePose?.boneTransforms ?? {}, activePose?.visibility ?? {});
-    poses = [...poses, pose]; activePoseId = pose.id; dirty = false; applyAllTransforms(); schedulePersist();
+    poses = [...poses, pose]; activePoseId = pose.id; rigEditMode = preferredRigEditMode; dirty = false; applyAllTransforms(); schedulePersist();
     commitHistory("Create pose", before);
     status = `${pose.name} created as an independent pose`;
   }
@@ -321,20 +411,20 @@
     if (!activePose) return;
     const before = captureDocument();
     const pose = createPose(`${activePose.name} copy`, activePose.transforms, activePose.boneTransforms, activePose.visibility);
-    poses = [...poses, pose]; activePoseId = pose.id; dirty = false; applyAllTransforms(); schedulePersist();
+    poses = [...poses, pose]; activePoseId = pose.id; rigEditMode = preferredRigEditMode; dirty = false; applyAllTransforms(); schedulePersist();
     commitHistory("Duplicate pose", before);
   }
   function deletePose(pose: Pose) {
     const before = captureDocument();
     poses = poses.filter((item) => item.id !== pose.id);
-    if (activePoseId === pose.id) activePoseId = "rest";
+    if (activePoseId === pose.id) { activePoseId = "rest"; rigEditMode = "setup"; }
     dirty = false; applyAllTransforms(); schedulePersist();
     commitHistory("Delete pose", before);
   }
   function choosePose(id: string, fromPlayback = false) {
     if (!fromPlayback && isPlaying) stopPlayback();
-    activePoseId = id; dirty = false;
-    if (id === "rest" && rigEditMode === "pose") rigEditMode = "setup";
+    activePoseId = id;
+    rigEditMode = id === "rest" ? "setup" : preferredRigEditMode;
     requestAnimationFrame(() => { if (viewMode === "rig" && rigEditMode === "setup") setupFrozenMatrices = calculatedGroupMatrices(); applyAllTransforms(); });
   }
   function stopPlayback() {
@@ -346,7 +436,7 @@
   }
   function playbackStep() {
     if (!isPlaying) return;
-    const frames = ["rest", ...poses.map((pose) => pose.id)];
+    const frames = poses.map((pose) => pose.id);
     if (frames.length === 0) return;
     const current = Math.max(0, frames.indexOf(activePoseId));
     choosePose(frames[(current + 1) % frames.length], true);
@@ -354,17 +444,18 @@
   }
   function togglePlayback() {
     if (isPlaying) { stopPlayback(); status = "Pose playback stopped"; return; }
-    if (!sourceSvg) return;
-    activePoseId = "rest";
+    if (!sourceSvg || poses.length === 0) { status = "Create at least one pose to play the animation."; return; }
+    activePoseId = poses[0].id;
+    rigEditMode = preferredRigEditMode;
     isPlaying = true;
     applyAllTransforms();
     playbackTimer = setTimeout(playbackStep, 1000 / playbackFps);
-    status = `Playing Rest + ${poses.length} pose${poses.length === 1 ? "" : "s"} at ${playbackFps} FPS`;
+    status = `Playing ${poses.length} pose${poses.length === 1 ? "" : "s"} at ${playbackFps} FPS`;
   }
   function changePlaybackFps(event: Event) {
     playbackFps = Number((event.currentTarget as HTMLSelectElement).value) || 2;
     if (isPlaying) { if (playbackTimer) clearTimeout(playbackTimer); playbackTimer = setTimeout(playbackStep, 1000 / playbackFps); }
-    schedulePersist();
+    dirty = true; schedulePersist();
   }
   function renamePose(event: Event) {
     if (!activePose) return;
@@ -412,6 +503,60 @@
     highlightBoneWrapper(svgHost, bones.find((bone) => bone.id === id)?.groupKey ?? null);
     if (viewMode !== "rig") showRig(); else leftMode = "rig";
   }
+  function fittedBoneForGroup(bone: Bone, groupKey: string): { bone: Bone; setup: BonePoseTransform } | null {
+    const wrapper = svgHost?.querySelector(`[data-studio-group="${CSS.escape(groupKey)}"]`) as SVGGElement | null;
+    if (!wrapper) return null;
+    try {
+      const box = wrapper.getBBox();
+      const currentWorld = boneWorlds[bone.id] ?? boneWorldMap(
+        [...bones, bone],
+        { ...effectiveBoneTransforms(activePose), [bone.id]: identityBoneTransform() },
+      )[bone.id];
+      const fitted = fitBoneToGroupBounds({
+        x: box.x,
+        y: box.y,
+        width: box.width,
+        height: box.height,
+        localToRoot: wrapperParentMatrices[groupKey] ?? [1, 0, 0, 1, 0, 0],
+      }, 0.08, Math.max(2, Math.min(viewBox[2], viewBox[3]) * 0.01), currentWorld ? {
+        x: currentWorld.endX - currentWorld.startX,
+        y: currentWorld.endY - currentWorld.startY,
+      } : undefined);
+      if (!fitted) return null;
+
+      const parentMatrix = bone.parentId ? boneWorlds[bone.parentId]?.matrix : null;
+      const parentInverse = parentMatrix ? invertMatrix(parentMatrix) : [1, 0, 0, 1, 0, 0] as Matrix;
+      const localStart = pointWithMatrix(parentInverse, fitted.startX, fitted.startY);
+      const localEnd = pointWithMatrix(parentInverse, fitted.endX, fitted.endY);
+      const dx = localEnd.x - localStart.x;
+      const dy = localEnd.y - localStart.y;
+      return {
+        bone: {
+          ...bone,
+          x: localStart.x,
+          y: localStart.y,
+          length: Math.max(1, Math.hypot(dx, dy)),
+          restRotation: Math.atan2(dy, dx) * 180 / Math.PI,
+        },
+        // The base geometry becomes the fitted placement. Compensating the
+        // active pose keeps Setup and Pose visually identical at fit time.
+        setup: relativeBoneTransform(identityBoneTransform(), currentBoneTransform(bone.id)),
+      };
+    } catch {
+      return null;
+    }
+  }
+  function fitSelectedBoneToGroup() {
+    if (!selectedBone?.groupKey || rigEditMode !== "setup") return;
+    const before = captureDocument();
+    const fitted = fittedBoneForGroup(selectedBone, selectedBone.groupKey);
+    if (!fitted) { status = "The bound group has no measurable artwork to fit."; return; }
+    bones = bones.map((bone) => bone.id === fitted.bone.id ? fitted.bone : bone);
+    setupBoneTransforms = { ...setupBoneTransforms, [fitted.bone.id]: fitted.setup };
+    applyAllTransforms(); schedulePersist();
+    commitHistory("Fit bone to group", before);
+    status = `${fitted.bone.name} centered and fitted to ${groups.find((group) => group.key === fitted.bone.groupKey)?.label}`;
+  }
   function addBone() {
     if (!sourceSvg) return;
     const before = captureDocument();
@@ -431,11 +576,16 @@
       length: parent ? Math.max(12, targetDistance || parent.length * 0.72) : Math.max(32, Math.min(viewBox[2], viewBox[3]) * 0.16),
       restRotation: parentWorld && pivot ? targetAngle - parentWorld.angle : 0,
     };
-    bones = [...bones.map((item) => item.groupKey === bone.groupKey ? { ...item, groupKey: null } : item), bone];
-    selectedBoneId = bone.id; showRig();
+    const fitted = bone.groupKey ? fittedBoneForGroup(bone, bone.groupKey) : null;
+    const placedBone = fitted?.bone ?? bone;
+    bones = [...bones.map((item) => item.groupKey === placedBone.groupKey ? { ...item, groupKey: null } : item), placedBone];
+    if (fitted) setupBoneTransforms = { ...setupBoneTransforms, [placedBone.id]: fitted.setup };
+    selectedBoneId = placedBone.id; showRig();
     applyAllTransforms(); schedulePersist();
     commitHistory("Add bone", before);
-    status = parent ? `${bone.name} added as a child of ${parent.name}` : `${bone.name} root created`;
+    status = fitted
+      ? `${placedBone.name} centered and fitted to ${group?.label}`
+      : parent ? `${placedBone.name} added as a child of ${parent.name}` : `${placedBone.name} root created`;
   }
   function updateBone(next: Bone, label = "Edit bone") {
     const before = captureDocument();
@@ -464,12 +614,17 @@
     if (!selectedBone) return;
     const before = captureDocument();
     const groupKey = (event.currentTarget as HTMLSelectElement).value || null;
+    const fitted = groupKey ? fittedBoneForGroup({ ...selectedBone, groupKey }, groupKey) : null;
+    const nextSelected = fitted?.bone ?? { ...selectedBone, groupKey };
     bones = bones.map((bone) => bone.id === selectedBone.id
-      ? { ...bone, groupKey }
+      ? nextSelected
       : groupKey && bone.groupKey === groupKey ? { ...bone, groupKey: null } : bone);
+    if (fitted) setupBoneTransforms = { ...setupBoneTransforms, [selectedBone.id]: fitted.setup };
     applyAllTransforms(); schedulePersist();
-    commitHistory("Bind bone to group", before);
-    status = groupKey ? `${selectedBone.name} bound to ${groups.find((group) => group.key === groupKey)?.label}` : `${selectedBone.name} unbound`;
+    commitHistory(groupKey ? "Bind and fit bone to group" : "Unbind bone from group", before);
+    status = groupKey
+      ? fitted ? `${selectedBone.name} bound, centered, and fitted to ${groups.find((group) => group.key === groupKey)?.label}` : `${selectedBone.name} bound to an empty group`
+      : `${selectedBone.name} unbound`;
   }
   function deleteBone() {
     if (!selectedBone) return;
@@ -615,7 +770,8 @@
     const unit = { x: dx / length, y: dy / length };
     if (boneDrag.gesture === "move") {
       const delta = { x: point.x - boneDrag.startPoint.x, y: point.y - boneDrag.startPoint.y };
-      applyBoneGeometry(boneDrag, { x: start.startX + delta.x, y: start.startY + delta.y }, { x: start.endX + delta.x, y: start.endY + delta.y });
+      const translated = translateBoneEndpoints(start, delta);
+      applyBoneGeometry(boneDrag, translated.start, translated.end);
     } else if (boneDrag.gesture === "rotate-end") {
       const angle = Math.atan2(point.y - start.startY, point.x - start.startX);
       applyBoneGeometry(boneDrag, { x: start.startX, y: start.startY }, { x: start.startX + Math.cos(angle) * length, y: start.startY + Math.sin(angle) * length });
@@ -646,11 +802,17 @@
     const rootSvg = svgHost.querySelector("svg");
     const inverse = rootSvg?.getScreenCTM()?.inverse();
     if (!inverse) return;
-    const startPoint = new DOMPoint(event.clientX, event.clientY).matrixTransform(inverse);
+    const rootPoint = new DOMPoint(event.clientX, event.clientY).matrixTransform(inverse);
     const sourcePivot = pivots[key] ?? { x: 0, y: 0 };
-    const pivot = pointWithMatrix(calculatedGroupMatrices()[key], sourcePivot.x, sourcePivot.y);
+    const directMatrix = matrixFor(currentTransform(key)) as Matrix;
+    const currentLocal = calculatedGroupMatrices()[key];
+    const rigPrefix = multiplyMatrix(currentLocal, invertMatrix(directMatrix));
+    const parentInverse = invertMatrix(wrapperParentMatrices[key] ?? [1, 0, 0, 1, 0, 0]);
+    const rootToTool = multiplyMatrix(invertMatrix(rigPrefix), parentInverse);
+    const startPoint = pointWithMatrix(rootToTool, rootPoint.x, rootPoint.y);
+    const pivot = pointWithMatrix(directMatrix, sourcePivot.x, sourcePivot.y);
     drag = {
-      pointerId: event.pointerId, key, startPoint, startTransform: { ...currentTransform(key) }, inverse, pivot,
+      pointerId: event.pointerId, key, startPoint, startTransform: { ...currentTransform(key) }, inverse, rootToTool, pivot,
       startAngle: Math.atan2(startPoint.y - pivot.y, startPoint.x - pivot.x),
       startDistance: Math.max(1, Math.hypot(startPoint.x - pivot.x, startPoint.y - pivot.y)),
       startDx: startPoint.x - pivot.x,
@@ -661,7 +823,8 @@
   }
   function pointerMove(event: PointerEvent) {
     if (!drag || drag.pointerId !== event.pointerId) return;
-    const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(drag.inverse);
+    const rootPoint = new DOMPoint(event.clientX, event.clientY).matrixTransform(drag.inverse);
+    const point = pointWithMatrix(drag.rootToTool, rootPoint.x, rootPoint.y);
     if (activeTool === "move") {
       updateTransform(drag.key, { ...drag.startTransform, x: drag.startTransform.x + point.x - drag.startPoint.x, y: drag.startTransform.y + point.y - drag.startPoint.y }, false, false);
     } else if (activeTool === "rotate") {
@@ -683,6 +846,12 @@
   function keyboardHandler(event: KeyboardEvent) {
     const shortcut = event.ctrlKey || event.metaKey;
     const shortcutKey = event.key.toLowerCase();
+    if (shortcut && !event.altKey && shortcutKey === "s") {
+      event.preventDefault(); void saveProject(event.shiftKey); return;
+    }
+    if (shortcut && !event.altKey && shortcutKey === "o") {
+      event.preventDefault(); void openProject(); return;
+    }
     if (shortcut && !event.altKey && shortcutKey === "z") {
       event.preventDefault();
       if (event.shiftKey) redo(); else undo();
@@ -754,7 +923,7 @@
   }
   function schedulePersist() {
     if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, aiPixelFilter, aiPaletteSize, primaryView: viewMode, pixelVisible, playbackFps } satisfies Session)), 250);
+    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, preferredRigEditMode, aiPixelFilter, aiPaletteSize, primaryView: viewMode, pixelVisible, playbackFps } satisfies Session)), 250);
   }
   async function exportPngInBrowser(svg: string, name: string) {
     try {
@@ -775,7 +944,6 @@
         await invoke("export_png", { svg, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, aiFilter: aiPixelFilter, aiPaletteSize: Math.round(aiPaletteSize) });
         status = `Exported ${path.split(/[\\/]/).pop()}`;
       } else { await exportPngInBrowser(svg, defaultName); status = `Exported ${defaultName}`; }
-      dirty = false;
     } catch (error) { status = error instanceof Error ? error.message : String(error); }
   }
   function serializePoseFrame(pose: Pose | null): string {
@@ -787,7 +955,7 @@
     return serializeForExport(svgHost);
   }
   function serializeAllFrames(): string[] {
-    const frames = [serializePoseFrame(null), ...poses.map((pose) => serializePoseFrame(pose))];
+    const frames = poses.map((pose) => serializePoseFrame(pose));
     applyAllTransforms();
     return frames;
   }
@@ -807,7 +975,7 @@
     const link = document.createElement("a"); link.href = URL.createObjectURL(png); link.download = name; link.click(); URL.revokeObjectURL(link.href);
   }
   async function exportTileset() {
-    if (!sourceSvg) return;
+    if (!sourceSvg || poses.length === 0) { status = "Create at least one pose to export a tileset."; return; }
     const svgs = serializeAllFrames();
     const base = fileName.replace(/\.svg$/i, "");
     const defaultName = `${base}-tileset-${svgs.length}f-${outputWidth}x${outputHeight}.png`;
@@ -828,10 +996,11 @@
 <svelte:window onkeydown={keyboardHandler} />
 <main class="studio-shell">
   <input bind:this={fileInput} class="hidden-input" type="file" accept="image/svg+xml,.svg" onchange={receiveFile} />
+  <input bind:this={projectFileInput} class="hidden-input" type="file" accept=".astd,application/json" onchange={receiveProjectFile} />
   <header class="topbar">
     <div class="brand-block"><span class="brand-mark">AS</span><div><strong>ASSET/STUDIO</strong><small>VECTOR POSE LAB</small></div></div>
-    <div class="document-pill" title={fileName}><span class:live={Boolean(sourceSvg)}></span><div><small>SOURCE · READ ONLY</small><strong>{fileName}</strong></div></div>
-    <div class="top-actions"><div class="history-actions" aria-label="Edit history"><button disabled={!undoStack.length} onclick={undo} title="Undo (Ctrl+Z)">↶<small>CTRL Z</small></button><button disabled={!redoStack.length} onclick={redo} title="Redo (Ctrl+Y)">↷<small>CTRL Y</small></button></div><button class="button ghost" onclick={openSvg}><span>↗</span> Open SVG</button><button class="button primary" disabled={!sourceSvg} onclick={exportPng}><span>↓</span> Export PNG</button></div>
+    <div class="document-pill" title={`${projectName} · ${fileName}`}><span class:live={Boolean(sourceSvg)} class:dirty></span><div><small>{projectPath ? `${projectName}${dirty ? " · MODIFIED" : " · SAVED"}` : `UNSAVED .ASTD${dirty ? " · MODIFIED" : " · RECOVERED"}`}</small><strong>{fileName}</strong></div></div>
+    <div class="top-actions"><div class="history-actions" aria-label="Edit history"><button disabled={!undoStack.length} onclick={undo} title="Undo (Ctrl+Z)">↶<small>CTRL Z</small></button><button disabled={!redoStack.length} onclick={redo} title="Redo (Ctrl+Y)">↷<small>CTRL Y</small></button></div><div class="file-actions" aria-label="Project files"><button onclick={openSvg} title="Import SVG"><span>↗</span><small>SVG</small></button><button onclick={openProject} title="Open .astd project (Ctrl+O)"><span>⌁</span><small>OPEN</small></button><button disabled={!sourceSvg} onclick={() => saveProject(false)} title="Save .astd project (Ctrl+S)"><span>▣</span><small>SAVE</small></button><button disabled={!sourceSvg} onclick={() => saveProject(true)} title="Save project as (Ctrl+Shift+S)"><span>＋</span><small>AS</small></button></div><button class="button primary" disabled={!sourceSvg} onclick={exportPng}><span>↓</span> Export PNG</button></div>
   </header>
 
   <section class="workspace">
@@ -880,7 +1049,7 @@
       </div>
       <div class="tool-optionsbar">
         <div class="active-tool-readout"><span>{viewMode === null ? "▦" : viewMode === "rig" ? "⌘" : activeTool === "move" ? "✥" : activeTool === "rotate" ? "↻" : "⌗"}</span><strong>{viewMode === null ? "PIXEL OUTPUT" : viewMode === "rig" ? "SMART BONE" : activeTool.toUpperCase()}</strong><small>{viewMode === null ? "SOLO PREVIEW" : viewMode === "rig" ? "POSITION-SENSITIVE" : activeTool === "move" ? "DRAG SELECTION" : activeTool === "rotate" ? "DRAG AROUND PIVOT" : "DRAG TO RESIZE"}</small></div>
-        {#if viewMode === "rig"}<div class="smart-gesture-legend"><span><i class="move-mark">✥</i> MIDDLE · MOVE</span><span><i class="rotate-mark">↻</i> END / OUTSIDE · ROTATE</span><span><i class="scale-mark">↔</i> END RING · RESIZE</span></div>{:else if viewMode === null}<div class="tool-hint">CLICK VECTOR OR RIG TO DOCK IT BESIDE PIXEL</div>{:else if activeTool === "scale"}<div class="transform-options"><button class:active={lockRatio} onclick={() => { lockRatio = !lockRatio; if (lockRatio) preserveArea = false; }}><span>⛓</span> LOCK RATIO</button><button class:active={preserveArea} onclick={() => { preserveArea = !preserveArea; if (preserveArea) lockRatio = false; }}><span>◫</span> KEEP AREA</button></div>{:else}<div class="tool-hint">{activeTool === "move" ? "SHIFT + ARROWS · 10 UNITS" : "PIVOT-CENTERED · NON-DESTRUCTIVE"}</div>{/if}
+        {#if viewMode === "rig"}<div class="smart-gesture-legend"><span><i class="move-mark">✥</i> MIDDLE · MOVE</span><span><i class="rotate-mark">↻</i> SMALL END · ROTATE</span><span><i class="scale-mark">↔</i> END RING · RESIZE</span></div>{:else if viewMode === null}<div class="tool-hint">CLICK VECTOR OR RIG TO DOCK IT BESIDE PIXEL</div>{:else if activeTool === "scale"}<div class="transform-options"><button class:active={lockRatio} onclick={() => { lockRatio = !lockRatio; if (lockRatio) preserveArea = false; }}><span>⛓</span> LOCK RATIO</button><button class:active={preserveArea} onclick={() => { preserveArea = !preserveArea; if (preserveArea) lockRatio = false; }}><span>◫</span> KEEP AREA</button></div>{:else}<div class="tool-hint">{activeTool === "move" ? "SHIFT + ARROWS · 10 UNITS" : "PIVOT-CENTERED · NON-DESTRUCTIVE"}</div>{/if}
         <div class="options-spacer"></div>
         {#if viewMode === "rig"}<div class="rig-mode-switch"><span>RIG MODE</span><button class:active={rigEditMode === "setup"} onclick={() => setRigEditMode("setup")}><b>01</b> SETUP</button><button class:active={rigEditMode === "pose"} disabled={!activePose} onclick={() => setRigEditMode("pose")}><b>02</b> POSE</button></div>{/if}
       </div>
@@ -902,16 +1071,17 @@
                 {#each renderedBones as bone}
                   {@const world = boneWorlds[bone.id]}
                   {@const handleRadius = Math.max(3, Math.min(viewBox[2], viewBox[3]) * 0.009)}
+                  {@const parentLinked = Boolean(bone.parentId)}
                   {#if world}<g class="bone-shape" class:selected={selectedBoneId === bone.id} aria-label={bone.name}>
                     <line class="bone-hit bone-move-hit" data-bone-id={bone.id} data-bone-gesture="move" style={`cursor:${moveCursor}`} x1={world.startX} y1={world.startY} x2={world.endX} y2={world.endY}></line>
-                    <circle class="bone-orbit-hit" data-bone-id={bone.id} data-bone-gesture="rotate-start" style={`cursor:${rotateCursor}`} cx={world.startX} cy={world.startY} r={handleRadius * 3.1}></circle>
+                    {#if !parentLinked}<circle class="bone-orbit-hit" data-bone-id={bone.id} data-bone-gesture="rotate-start" style={`cursor:${rotateCursor}`} cx={world.startX} cy={world.startY} r={handleRadius * 3.1}></circle>{/if}
                     <circle class="bone-orbit-hit" data-bone-id={bone.id} data-bone-gesture="rotate-end" style={`cursor:${rotateCursor}`} cx={world.endX} cy={world.endY} r={handleRadius * 3.1}></circle>
-                    <circle class="bone-scale-hit" data-bone-id={bone.id} data-bone-gesture="scale-start" style={`cursor:${resizeCursor(world.angle)}`} cx={world.startX} cy={world.startY} r={handleRadius * 1.85}></circle>
+                    {#if !parentLinked}<circle class="bone-scale-hit" data-bone-id={bone.id} data-bone-gesture="scale-start" style={`cursor:${resizeCursor(world.angle)}`} cx={world.startX} cy={world.startY} r={handleRadius * 1.85}></circle>{/if}
                     <circle class="bone-scale-hit" data-bone-id={bone.id} data-bone-gesture="scale-end" style={`cursor:${resizeCursor(world.angle)}`} cx={world.endX} cy={world.endY} r={handleRadius * 1.85}></circle>
-                    <circle class="bone-end-hit" data-bone-id={bone.id} data-bone-gesture="rotate-start" style={`cursor:${rotateCursor}`} cx={world.startX} cy={world.startY} r={handleRadius}></circle>
+                    {#if !parentLinked}<circle class="bone-end-hit" data-bone-id={bone.id} data-bone-gesture="rotate-start" style={`cursor:${rotateCursor}`} cx={world.startX} cy={world.startY} r={handleRadius}></circle>{/if}
                     <circle class="bone-end-hit" data-bone-id={bone.id} data-bone-gesture="rotate-end" style={`cursor:${rotateCursor}`} cx={world.endX} cy={world.endY} r={handleRadius}></circle>
                     <line class="bone-body" x1={world.startX} y1={world.startY} x2={world.endX} y2={world.endY}></line>
-                    <circle class="bone-joint" cx={world.startX} cy={world.startY} r={handleRadius}></circle>
+                    <circle class="bone-joint" class:linked={parentLinked} cx={world.startX} cy={world.startY} r={handleRadius * (parentLinked ? 1.4 : 1)}></circle>
                     <circle class="bone-tip" cx={world.endX} cy={world.endY} r={handleRadius * .72}></circle>
                     {#if boneDrag?.boneId === bone.id && (boneDrag.gesture === "rotate-end" || boneDrag.gesture === "scale-end")}<circle class="pivot-lock" cx={world.startX} cy={world.startY} r={handleRadius * 1.55}></circle>{/if}
                     {#if boneDrag?.boneId === bone.id && (boneDrag.gesture === "rotate-start" || boneDrag.gesture === "scale-start")}<circle class="pivot-lock" cx={world.endX} cy={world.endY} r={handleRadius * 1.55}></circle>{/if}
@@ -927,7 +1097,7 @@
         </div>
         {#if !sourceSvg}<button class="drop-target" onclick={openSvg}><span class="drop-icon">＋</span><strong>LOAD YOUR VECTOR</strong><p>SVG groups become poseable layers.</p><small>OPEN .SVG</small></button>{/if}
       </div>
-      <div class="statusbar"><span class="status-light"></span><span>{status}</span><span class="status-spacer"></span><span>{dirty ? "UNSAVED POSE CHANGE" : "AUTOSAVED"}</span><span class="separator">/</span><span>{canvasBackend}</span><span class="separator">/</span><span>{wasmReady ? "RUST CORE ONLINE" : "CORE FALLBACK"}</span></div>
+      <div class="statusbar"><span class="status-light"></span><span>{status}</span><span class="status-spacer"></span><span>{dirty ? "PROJECT MODIFIED · CTRL S" : projectPath ? "PROJECT SAVED" : "LOCAL RECOVERY ON"}</span><span class="separator">/</span><span>{canvasBackend}</span><span class="separator">/</span><span>{wasmReady ? "RUST CORE ONLINE" : "CORE FALLBACK"}</span></div>
     </section>
 
     <aside class="panel inspector-panel">
@@ -937,7 +1107,14 @@
         <div class:follow={rigEditMode === "pose"} class="rig-behavior-note"><span>{rigEditMode === "setup" ? "01" : "02"}</span><div><strong>{rigEditMode === "setup" ? "Artwork frozen · guides live" : "Artwork follows the same guides"}</strong><small>{rigEditMode === "setup" ? "Arrange the guide placement freely. Switching to Pose keeps every bone exactly where you put it." : "The guide does not jump when modes change; bound groups now follow its current placement."}</small></div></div>
         <div class="control-section" class:disabled={rigEditMode !== "setup"}><div class="section-label"><span>IDENTITY</span><small>RIG DATA</small></div><label class="wide-control text-control"><span>N</span><input disabled={rigEditMode !== "setup"} value={selectedBone.name} onchange={changeBoneName} /></label></div>
         <div class="control-section" class:disabled={rigEditMode !== "setup"}><div class="section-label"><span>HIERARCHY</span><small>PARENT → CHILD</small></div><label class="select-control"><span>P</span><select disabled={rigEditMode !== "setup"} value={selectedBone.parentId ?? ""} onchange={changeBoneParent}><option value="">ROOT</option>{#each bones.filter((bone) => bone.id !== selectedBone.id && !wouldCreateCycle(selectedBone.id, bone.id, bones)) as bone}<option value={bone.id}>{bone.name}</option>{/each}</select></label><label class="select-control"><span>G</span><select disabled={rigEditMode !== "setup"} value={selectedBone.groupKey ?? ""} onchange={changeBoneBinding}><option value="">GUIDE ONLY</option>{#each groups as group}<option value={group.key}>{group.label}</option>{/each}</select></label></div>
-        <div class="control-section" class:disabled={rigEditMode !== "setup"}><div class="section-label"><span>BASE BONE</span><small>GLOBAL RIG</small></div><div class="control-grid"><label><span>X</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.x.toFixed(2)} oninput={(event) => changeBoneNumber("x", event)} /></label><label><span>Y</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.y.toFixed(2)} oninput={(event) => changeBoneNumber("y", event)} /></label></div><div class="control-grid second-row"><label><span>L</span><input disabled={rigEditMode !== "setup"} type="number" min="1" step="1" value={selectedBone.length.toFixed(2)} oninput={(event) => changeBoneNumber("length", event)} /></label><label><span>R</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.restRotation.toFixed(2)} oninput={(event) => changeBoneNumber("restRotation", event)} /></label></div></div>
+        <div class="control-section" class:disabled={rigEditMode !== "setup"}>
+          <div class="section-label"><span>BASE BONE</span><small>GLOBAL RIG</small></div>
+          <div class="control-grid"><label><span>X</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.x.toFixed(2)} oninput={(event) => changeBoneNumber("x", event)} /></label><label><span>Y</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.y.toFixed(2)} oninput={(event) => changeBoneNumber("y", event)} /></label></div>
+          <div class="control-grid second-row"><label><span>L</span><input disabled={rigEditMode !== "setup"} type="number" min="1" step="1" value={selectedBone.length.toFixed(2)} oninput={(event) => changeBoneNumber("length", event)} /></label><label><span>R</span><input disabled={rigEditMode !== "setup"} type="number" step="1" value={selectedBone.restRotation.toFixed(2)} oninput={(event) => changeBoneNumber("restRotation", event)} /></label></div>
+          <button class="bone-fit-action" disabled={rigEditMode !== "setup" || !selectedBone.groupKey} title={selectedBone.groupKey ? "Center and size this bone to its bound SVG group" : "Bind this bone to a group first"} onclick={fitSelectedBoneToGroup}>
+            <span class="fit-reticle">⌖</span><span><strong>FIT TO GROUP</strong><small>PRESERVE ANGLE · 8% INSET</small></span><i>↔</i>
+          </button>
+        </div>
         {@const bonePose = rigEditMode === "setup" ? currentSetupBoneTransform(selectedBone.id) : currentBoneTransform(selectedBone.id)}
         {@const boneControlsDisabled = rigEditMode === "pose" && !activePose}
         <div class="control-section" class:disabled={boneControlsDisabled}><div class="section-label"><span>{rigEditMode === "setup" ? "GUIDE PLACEMENT" : "POSE TRANSFORM"}</span><small>NON-DESTRUCTIVE</small></div><div class="control-grid"><label><span>X</span><input disabled={boneControlsDisabled} type="number" step="1" value={bonePose.x.toFixed(2)} oninput={(event) => changeBonePoseNumber("x", event)} /></label><label><span>Y</span><input disabled={boneControlsDisabled} type="number" step="1" value={bonePose.y.toFixed(2)} oninput={(event) => changeBonePoseNumber("y", event)} /></label></div><label class="wide-control second-row"><span>R</span><input disabled={boneControlsDisabled} type="number" step="1" value={bonePose.rotation.toFixed(2)} oninput={changeBoneRotation} /></label><div class="control-grid second-row"><label><span>W</span><input disabled={boneControlsDisabled} type="number" min="0.02" step="0.05" value={bonePose.scaleX.toFixed(3)} oninput={(event) => changeBonePoseNumber("scaleX", event)} /></label><label><span>H</span><input disabled={boneControlsDisabled} type="number" min="0.02" step="0.05" value={bonePose.scaleY.toFixed(3)} oninput={(event) => changeBonePoseNumber("scaleY", event)} /></label></div></div>
@@ -952,17 +1129,17 @@
       {:else}<div class="empty-panel compact"><span class="empty-glyph">⌖</span><strong>No selection</strong><p>Select an SVG group or bone.</p></div>{/if}
       <div class="export-panel">
         <div class="section-label"><span>PIXEL OUTPUT</span><small>PNG</small></div>
-        <div class="resolution-control"><label><span>W</span><input type="number" min="1" max="16384" bind:value={outputWidth} onchange={() => { schedulePreview(); schedulePersist(); }} /></label><span class="times">×</span><label><span>H</span><input type="number" min="1" max="16384" bind:value={outputHeight} onchange={() => { schedulePreview(); schedulePersist(); }} /></label></div>
-        <div class="pixel-option"><div class="option-copy"><span>EDGE ANTIALIAS</span><strong>{antiAlias === 0 ? "0 · BINARY ALPHA" : `${antiAlias}%`}</strong></div><input aria-label="Edge antialias" type="range" min="0" max="100" step="1" bind:value={antiAlias} oninput={() => { schedulePreview(); schedulePersist(); }} /></div>
-        <label class="select-control pixel-fit"><span>↔</span><select bind:value={resizeMode} onchange={() => { schedulePreview(); schedulePersist(); }}><option value="contain">FIT RATIO · CENTERED</option><option value="stretch">STRETCH TO OUTPUT</option></select></label>
+        <div class="resolution-control"><label><span>W</span><input type="number" min="1" max="16384" bind:value={outputWidth} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></label><span class="times">×</span><label><span>H</span><input type="number" min="1" max="16384" bind:value={outputHeight} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></label></div>
+        <div class="pixel-option"><div class="option-copy"><span>EDGE ANTIALIAS</span><strong>{antiAlias === 0 ? "0 · BINARY ALPHA" : `${antiAlias}%`}</strong></div><input aria-label="Edge antialias" type="range" min="0" max="100" step="1" bind:value={antiAlias} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
+        <label class="select-control pixel-fit"><span>↔</span><select bind:value={resizeMode} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }}><option value="contain">FIT RATIO · CENTERED</option><option value="stretch">STRETCH TO OUTPUT</option></select></label>
         <p class="option-note">At 0, every visible edge pixel is fully opaque and every empty pixel is fully transparent—no partial alpha.</p>
         <div class:active={aiPixelFilter} class="ai-filter-card">
-          <label class="ai-toggle"><input type="checkbox" bind:checked={aiPixelFilter} disabled={!desktopRuntime} onchange={() => { schedulePreview(); schedulePersist(); }} /><span class="toggle-track"><i></i></span><span><strong>OFFLINE PIXEL AI</strong><small>{desktopRuntime ? "LOCAL · NO NETWORK" : "DESKTOP APP ONLY"}</small></span></label>
-          <div class="ai-palette" class:disabled={!aiPixelFilter}><div class="option-copy"><span>LEARNED PALETTE</span><strong>{aiPaletteSize} COLORS</strong></div><input aria-label="AI palette colors" disabled={!aiPixelFilter} type="range" min="2" max="64" step="1" bind:value={aiPaletteSize} oninput={() => { schedulePreview(); schedulePersist(); }} /></div>
+          <label class="ai-toggle"><input type="checkbox" bind:checked={aiPixelFilter} disabled={!desktopRuntime} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }} /><span class="toggle-track"><i></i></span><span><strong>OFFLINE PIXEL AI</strong><small>{desktopRuntime ? "LOCAL · NO NETWORK" : "DESKTOP APP ONLY"}</small></span></label>
+          <div class="ai-palette" class:disabled={!aiPixelFilter}><div class="option-copy"><span>LEARNED PALETTE</span><strong>{aiPaletteSize} COLORS</strong></div><input aria-label="AI palette colors" disabled={!aiPixelFilter} type="range" min="2" max="64" step="1" bind:value={aiPaletteSize} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
           <p>The local NumPy model learns the asset's palette, hardens alpha, and removes isolated color noise. No files leave this computer.</p>
         </div>
         <button class="export-wide" disabled={!sourceSvg} onclick={exportPng}>EXPORT ACTIVE POSE <span>↓</span></button>
-        <button class="export-wide secondary" disabled={!sourceSvg} onclick={exportTileset}>EXPORT REST + {poses.length} POSE{poses.length === 1 ? "" : "S"} <span>▦</span></button>
+        <button class="export-wide secondary" disabled={!sourceSvg || poses.length === 0} onclick={exportTileset}>EXPORT {poses.length} POSE{poses.length === 1 ? "" : "S"} <span>▦</span></button>
       </div>
     </aside>
   </section>
@@ -975,9 +1152,9 @@
       <button class="new-pose" disabled={!sourceSvg} onclick={addPose}><span>＋</span><strong>NEW POSE</strong><small>SNAPSHOT CURRENT</small></button>
     </div>
     <div class="pose-actions">
-      <div class="playback-control"><button class:playing={isPlaying} disabled={!sourceSvg} onclick={togglePlayback}><span>{isPlaying ? "■" : "▶"}</span>{isPlaying ? "STOP" : "PLAY ALL"}</button><select aria-label="Playback speed" value={playbackFps} onchange={changePlaybackFps}><option value="1">1 FPS</option><option value="2">2 FPS</option><option value="4">4 FPS</option><option value="8">8 FPS</option></select></div>
-      <small class="frame-readout">REST + {poses.length} POSE{poses.length === 1 ? "" : "S"} · {frameCount} FRAMES</small>
-      {#if activePose}<input aria-label="Pose name" value={activePose.name} onchange={renamePose} /><button onclick={duplicatePose}>DUPLICATE</button>{:else}<span>{isPlaying ? "PLAYING REST FRAME" : "Select or create a pose"}</span>{/if}
+      <div class="playback-control"><button class:playing={isPlaying} disabled={!sourceSvg || poses.length === 0} onclick={togglePlayback}><span>{isPlaying ? "■" : "▶"}</span>{isPlaying ? "STOP" : "PLAY POSES"}</button><select aria-label="Playback speed" value={playbackFps} onchange={changePlaybackFps}><option value="1">1 FPS</option><option value="2">2 FPS</option><option value="4">4 FPS</option><option value="8">8 FPS</option></select></div>
+      <small class="frame-readout">{poses.length} POSE{poses.length === 1 ? "" : "S"} · {frameCount} EXPORT FRAME{frameCount === 1 ? "" : "S"}</small>
+      {#if activePose}<input aria-label="Pose name" value={activePose.name} onchange={renamePose} /><button onclick={duplicatePose}>DUPLICATE</button>{:else}<span>REST PREVIEW · NOT EXPORTED</span>{/if}
     </div>
   </footer>
 </main>

@@ -1,4 +1,4 @@
-import { identityBoneTransform, type Bone, type BonePoseTransform } from "./model";
+import { identityBoneTransform, type Bone, type BonePoseTransform, type SvgGroup } from "./model";
 
 export type Matrix = [number, number, number, number, number, number];
 
@@ -11,7 +11,82 @@ export type BoneWorld = {
   angle: number;
 };
 
+export type BoneEndpoints = {
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+};
+
+export type GroupFitBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  localToRoot: Matrix;
+};
+
 export const IDENTITY_MATRIX: Matrix = [1, 0, 0, 1, 0, 0];
+
+export function translateBoneEndpoints(
+  endpoints: BoneEndpoints,
+  delta: { x: number; y: number },
+): { start: { x: number; y: number }; end: { x: number; y: number } } {
+  return {
+    start: { x: endpoints.startX + delta.x, y: endpoints.startY + delta.y },
+    end: { x: endpoints.endX + delta.x, y: endpoints.endY + delta.y },
+  };
+}
+
+/**
+ * Fit a bone through the centre of a group while preserving its authored
+ * direction when supplied. Padding is an inset, keeping both joints inside
+ * the shape instead of extending the guide beyond the artwork.
+ */
+export function fitBoneToGroupBounds(
+  bounds: GroupFitBounds,
+  paddingRatio = 0.08,
+  minimumPadding = 2,
+  preferredDirection?: { x: number; y: number },
+): BoneEndpoints | null {
+  const centre = {
+    x: bounds.x + bounds.width / 2,
+    y: bounds.y + bounds.height / 2,
+  };
+  const worldCentre = {
+    x: bounds.localToRoot[0] * centre.x + bounds.localToRoot[2] * centre.y + bounds.localToRoot[4],
+    y: bounds.localToRoot[1] * centre.x + bounds.localToRoot[3] * centre.y + bounds.localToRoot[5],
+  };
+  const horizontal = {
+    x: bounds.localToRoot[0] * bounds.width,
+    y: bounds.localToRoot[1] * bounds.width,
+  };
+  const vertical = {
+    x: bounds.localToRoot[2] * bounds.height,
+    y: bounds.localToRoot[3] * bounds.height,
+  };
+  const horizontalLength = Math.hypot(horizontal.x, horizontal.y);
+  const verticalLength = Math.hypot(vertical.x, vertical.y);
+  const axisLength = Math.max(horizontalLength, verticalLength);
+  if (!Number.isFinite(axisLength) || axisLength < 1e-6) return null;
+
+  const preferredLength = preferredDirection ? Math.hypot(preferredDirection.x, preferredDirection.y) : 0;
+  const fallbackAxis = horizontalLength >= verticalLength ? horizontal : vertical;
+  const unit = preferredDirection && preferredLength > 1e-6
+    ? { x: preferredDirection.x / preferredLength, y: preferredDirection.y / preferredLength }
+    : { x: fallbackAxis.x / axisLength, y: fallbackAxis.y / axisLength };
+  const padding = Math.min(
+    axisLength * 0.4,
+    Math.max(Math.max(0, minimumPadding), axisLength * Math.max(0, paddingRatio)),
+  );
+  const halfLength = Math.max(axisLength * 0.1, axisLength / 2 - padding);
+  return {
+    startX: worldCentre.x - unit.x * halfLength,
+    startY: worldCentre.y - unit.y * halfLength,
+    endX: worldCentre.x + unit.x * halfLength,
+    endY: worldCentre.y + unit.y * halfLength,
+  };
+}
 
 export function multiplyMatrix(left: Matrix, right: Matrix): Matrix {
   return [
@@ -115,6 +190,38 @@ export function boneGroupMatrices(
     matrices[bone.groupKey] = multiplyMatrix(posed[bone.id].matrix, invertMatrix(rest[bone.id].matrix));
   }
   return matrices;
+}
+
+/**
+ * Convert absolute root-space rig deltas into wrapper-local matrices without
+ * applying an ancestor group's motion twice. Unbound descendants inherit the
+ * nearest parent target; a group with its own bone uses that bone's absolute
+ * root-space target and factors the SVG-parent target back out.
+ */
+export function composeGroupLocalMatrices(
+  groups: SvgGroup[],
+  parentToRoot: Record<string, Matrix>,
+  rigRootMatrices: Record<string, Matrix>,
+  directLocalMatrices: Record<string, Matrix>,
+): Record<string, Matrix> {
+  const targets: Record<string, Matrix> = {};
+  const locals: Record<string, Matrix> = {};
+  for (const group of [...groups].sort((left, right) => left.depth - right.depth)) {
+    const parentTarget = group.parentKey ? targets[group.parentKey] ?? IDENTITY_MATRIX : IDENTITY_MATRIX;
+    const parentRest = parentToRoot[group.key] ?? IDENTITY_MATRIX;
+    const directLocal = directLocalMatrices[group.key] ?? IDENTITY_MATRIX;
+    const directRoot = multiplyMatrix(multiplyMatrix(parentRest, directLocal), invertMatrix(parentRest));
+    const rigRoot = rigRootMatrices[group.key];
+    const target = rigRoot
+      ? multiplyMatrix(rigRoot, directRoot)
+      : multiplyMatrix(parentTarget, directRoot);
+    targets[group.key] = target;
+    locals[group.key] = multiplyMatrix(
+      multiplyMatrix(multiplyMatrix(invertMatrix(parentRest), invertMatrix(parentTarget)), target),
+      parentRest,
+    );
+  }
+  return locals;
 }
 
 export function boneDepth(bone: Bone, bones: Bone[]): number {

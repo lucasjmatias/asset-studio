@@ -19,6 +19,7 @@ button { color: inherit; }
 .document-pill { justify-self: center; min-width: 300px; max-width: 520px; display: flex; align-items: center; gap: 11px; padding: 8px 15px; border: 1px solid var(--line); background: #0f1214; }
 .document-pill > span { width: 7px; height: 7px; border-radius: 50%; background: #4b5356; box-shadow: 0 0 0 4px #1b2023; }
 .document-pill > span.live { background: #78aa7b; }
+.document-pill > span.dirty { background: var(--acid); box-shadow: 0 0 0 4px #332a19,0 0 10px #e7b75a66; }
 .document-pill div { min-width: 0; }
 .document-pill small,.document-pill strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .document-pill small { color: var(--muted); font: 9px "Cascadia Mono", monospace; letter-spacing: .15em; }
@@ -29,6 +30,12 @@ button { color: inherit; }
 .history-actions button:last-child { border-right: 0; }
 .history-actions button:hover:not(:disabled) { background: #232a2d; color: var(--acid); }
 .history-actions small { display: block; margin-top: 2px; color: #596367; font-size: 5px; letter-spacing: .03em; }
+.file-actions { display: flex; height: 36px; border: 1px solid var(--line); background: #0e1214; }
+.file-actions button { width: 42px; border: 0; border-right: 1px solid var(--line); background: transparent; color: #9ea8aa; cursor: pointer; }
+.file-actions button:last-child { border-right: 0; }
+.file-actions button:hover:not(:disabled) { background: #22292c; color: var(--acid); }
+.file-actions span { display: block; font: 14px/1 "Cascadia Mono", monospace; }
+.file-actions small { display: block; margin-top: 3px; color: #657075; font: 5px "Cascadia Mono", monospace; letter-spacing: .08em; }
 .button { height: 36px; padding: 0 16px; border: 1px solid var(--line); background: transparent; cursor: pointer; font-size: 11px; font-weight: 700; letter-spacing: .08em; }
 .button span { margin-right: 7px; font-family: monospace; }
 .button:hover { border-color: #687276; background: #1c2124; }
@@ -168,6 +175,7 @@ h2 { margin: 2px 0 0; font-size: 16px; font-weight: 600; letter-spacing: .04em; 
 .bone-end-hit { fill: transparent; stroke: none; pointer-events: fill; }
 .bone-body { stroke: #5ab5c1; stroke-width: 6; stroke-linecap: round; vector-effect: non-scaling-stroke; filter: drop-shadow(0 1px 2px #061013aa); }
 .bone-joint { fill: #12191b; stroke: #87d9df; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.bone-joint.linked { fill: #14272a; stroke: #f4c96d; stroke-width: 3; filter: drop-shadow(0 0 3px #e7b75a88); }
 .bone-tip { fill: #87d9df; stroke: #101517; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .bone-body,.bone-joint,.bone-tip { pointer-events: none; }
 .pivot-lock { fill: none; stroke: #f4c96d; stroke-width: 2.5; stroke-dasharray: 2 2; vector-effect: non-scaling-stroke; pointer-events: none; filter: drop-shadow(0 0 3px #e7b75a); animation: pivot-lock-pulse .7s ease-in-out infinite alternate; }
@@ -220,6 +228,15 @@ h2 { margin: 2px 0 0; font-size: 16px; font-weight: 600; letter-spacing: .04em; 
 .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .control-grid.second-row { margin-top: 7px; }
 .wide-control.second-row { margin-top: 7px; }
+.bone-fit-action { width: 100%; min-height: 42px; margin-top: 9px; padding: 0; display: grid; grid-template-columns: 34px minmax(0,1fr) 28px; align-items: stretch; border: 1px solid #3d6267; background: linear-gradient(90deg,#142326,#111719); color: #a8d6d8; cursor: pointer; text-align: left; transition: border-color .14s,background .14s,color .14s; }
+.bone-fit-action:hover:not(:disabled) { border-color: #82c8ce; background: linear-gradient(90deg,#193034,#142024); color: #d2eeee; box-shadow: inset 2px 0 #82c8ce; }
+.bone-fit-action:disabled { cursor: not-allowed; filter: saturate(.35); opacity: .5; }
+.bone-fit-action .fit-reticle { display: grid; place-items: center; border-right: 1px solid #365157; color: #82c8ce; font: 16px "Cascadia Mono", monospace; }
+.bone-fit-action > span:nth-child(2) { align-self: center; padding: 7px 8px; }
+.bone-fit-action strong,.bone-fit-action small { display: block; }
+.bone-fit-action strong { font: 8px "Cascadia Mono", monospace; letter-spacing: .11em; }
+.bone-fit-action small { margin-top: 3px; color: #668186; font: 6px "Cascadia Mono", monospace; letter-spacing: .07em; }
+.bone-fit-action i { display: grid; place-items: center; border-left: 1px solid #365157; color: var(--acid); font: normal 11px "Cascadia Mono", monospace; }
 .control-grid label,.wide-control,.resolution-control label { height: 34px; display: grid; grid-template-columns: 25px 1fr; align-items: center; border: 1px solid var(--line); background: #111518; }
 label > span { text-align: center; color: var(--acid); font: 9px "Cascadia Mono", monospace; }
 label input { min-width: 0; width: 100%; height: 100%; padding: 0 7px; border: 0; border-left: 1px solid var(--line); outline: 0; background: transparent; color: #d9ddd8; font: 10px "Cascadia Mono", monospace; }
