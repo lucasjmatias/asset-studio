@@ -28,6 +28,24 @@ export type GroupFitBounds = {
 
 export const IDENTITY_MATRIX: Matrix = [1, 0, 0, 1, 0, 0];
 
+export function dominantSampleOwner(
+  owners: Array<string | null>,
+  minimumCoverage = 0.6,
+): { key: string; coverage: number } | null {
+  if (owners.length === 0) return null;
+  const counts = new Map<string, number>();
+  for (const owner of owners) {
+    if (owner) counts.set(owner, (counts.get(owner) ?? 0) + 1);
+  }
+  let winner: { key: string; count: number } | null = null;
+  for (const [key, count] of counts) {
+    if (!winner || count > winner.count) winner = { key, count };
+  }
+  if (!winner) return null;
+  const coverage = winner.count / owners.length;
+  return coverage >= minimumCoverage ? { key: winner.key, coverage } : null;
+}
+
 export function translateBoneEndpoints(
   endpoints: BoneEndpoints,
   delta: { x: number; y: number },

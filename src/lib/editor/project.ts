@@ -24,6 +24,8 @@ export type AstdProjectState = {
   resizeMode: PixelResizeMode;
   aiPixelFilter: boolean;
   aiPaletteSize: number;
+  pixelContourStrength: number;
+  pixelDetailFloor: number;
   preferredRigEditMode: "setup" | "pose";
   primaryView: "vector" | "rig" | null;
   pixelVisible: boolean;
@@ -72,6 +74,8 @@ export function decodeAstdProject(contents: string): AstdProject {
     transforms: pose.transforms ?? {},
     boneTransforms: pose.boneTransforms ?? {},
     visibility: pose.visibility ?? {},
+    shapePaths: pose.shapePaths ?? {},
+    shapeNodeModes: pose.shapeNodeModes ?? {},
   })) : [];
   const state: AstdProjectState = {
     sourceSvg: raw.sourceSvg,
@@ -88,11 +92,13 @@ export function decodeAstdProject(contents: string): AstdProject {
     resizeMode: raw.resizeMode === "stretch" ? "stretch" : "contain",
     aiPixelFilter: raw.aiPixelFilter === true,
     aiPaletteSize: Math.max(2, Math.min(64, Math.round(finiteNumber(raw.aiPaletteSize, 16)))),
+    pixelContourStrength: Math.max(0, Math.min(100, Math.round(finiteNumber(raw.pixelContourStrength, 60)))),
+    pixelDetailFloor: Math.max(1, Math.min(4, Math.round(finiteNumber(raw.pixelDetailFloor, 2)))),
     preferredRigEditMode: raw.preferredRigEditMode === "pose" ? "pose" : "setup",
     primaryView: raw.primaryView === "rig" || raw.primaryView === null ? raw.primaryView : "vector",
     pixelVisible: raw.pixelVisible === true,
     playbackFps: [1, 2, 4, 8].includes(finiteNumber(raw.playbackFps, 2)) ? finiteNumber(raw.playbackFps, 2) : 2,
-    zoom: Math.max(0.5, Math.min(2, finiteNumber(raw.zoom, 1))),
+    zoom: Math.max(0.25, Math.min(4, finiteNumber(raw.zoom, 1))),
   };
   return {
     format: ASTD_FORMAT,

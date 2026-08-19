@@ -20,6 +20,8 @@ function fixture(): AstdProjectState {
     resizeMode: "contain",
     aiPixelFilter: true,
     aiPaletteSize: 12,
+    pixelContourStrength: 60,
+    pixelDetailFloor: 2,
     preferredRigEditMode: "pose",
     primaryView: "rig",
     pixelVisible: true,

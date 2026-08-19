@@ -2,6 +2,8 @@ import type { SvgGroup } from "./model";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XLINK_NS = "http://www.w3.org/1999/xlink";
+const editableShapeSelector = "path,rect,circle,ellipse,polygon,polyline,line";
+const geometryAttributes = new Set(["d", "x", "y", "x1", "y1", "x2", "y2", "width", "height", "rx", "ry", "cx", "cy", "r", "points"]);
 
 export type PreparedSvg = {
   markup: string;
@@ -150,6 +152,18 @@ export function prepareSvg(source: string): PreparedSvg {
     wrapper.appendChild(group);
   });
 
+  let shapeIndex = 0;
+  for (const shape of Array.from(root.querySelectorAll(editableShapeSelector))) {
+    if (shape.closest("defs,clipPath,mask,marker,pattern,symbol")) continue;
+    const owner = shape.closest("[data-studio-group]") as SVGElement | null;
+    if (!owner?.dataset.studioGroup) continue;
+    shape.setAttribute("data-studio-shape", `shape-${shapeIndex++}`);
+    shape.setAttribute("data-studio-shape-group", owner.dataset.studioGroup);
+    if (shape.localName.toLowerCase() === "path") {
+      shape.setAttribute("data-studio-source-d", shape.getAttribute("d") || "");
+    }
+  }
+
   return {
     markup: new XMLSerializer().serializeToString(root),
     groups,
@@ -164,13 +178,114 @@ export function serializeForExport(host: HTMLElement): string {
   const clone = svg.cloneNode(true) as SVGSVGElement;
   clone.removeAttribute("width");
   clone.removeAttribute("height");
-  for (const element of Array.from(clone.querySelectorAll("[data-studio-group]"))) {
-    element.removeAttribute("data-studio-group");
-    element.removeAttribute("data-selected");
-    element.removeAttribute("data-bone-bound");
-    element.removeAttribute("data-pose-hidden");
+  for (const original of Array.from(clone.querySelectorAll("[data-studio-pose-overridden]"))) {
+    original.remove();
+  }
+  for (const element of Array.from(clone.querySelectorAll("*"))) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (attribute.name.startsWith("data-studio-")) element.removeAttribute(attribute.name);
+    }
   }
   return new XMLSerializer().serializeToString(clone);
+}
+
+function numericAttribute(element: Element, name: string, fallback = 0): number {
+  const value = Number(element.getAttribute(name));
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function pathFromPoints(points: string, close: boolean): string | null {
+  const values = points.match(/[+-]?(?:\d*\.\d+|\d+\.?)(?:[eE][+-]?\d+)?/g)?.map(Number) ?? [];
+  if (values.length < 4) return null;
+  const commands = [`M${values[0]} ${values[1]}`];
+  for (let index = 2; index + 1 < values.length; index += 2) commands.push(`L${values[index]} ${values[index + 1]}`);
+  if (close) commands.push("Z");
+  return commands.join(" ");
+}
+
+/** Converts a supported SVG primitive into editable absolute path data. */
+export function shapeElementToPathData(element: Element): string | null {
+  const name = element.localName.toLowerCase();
+  if (name === "path") return element.getAttribute("data-studio-source-d") ?? element.getAttribute("d");
+  if (name === "line") return `M${numericAttribute(element, "x1")} ${numericAttribute(element, "y1")} L${numericAttribute(element, "x2")} ${numericAttribute(element, "y2")}`;
+  if (name === "polygon" || name === "polyline") return pathFromPoints(element.getAttribute("points") || "", name === "polygon");
+  if (name === "rect") {
+    const x = numericAttribute(element, "x"), y = numericAttribute(element, "y");
+    const width = Math.max(0, numericAttribute(element, "width")), height = Math.max(0, numericAttribute(element, "height"));
+    let rx = Math.max(0, numericAttribute(element, "rx"));
+    let ry = Math.max(0, numericAttribute(element, "ry"));
+    if (rx && !ry) ry = rx;
+    if (ry && !rx) rx = ry;
+    rx = Math.min(rx, width / 2); ry = Math.min(ry, height / 2);
+    if (!rx && !ry) return `M${x} ${y} L${x + width} ${y} L${x + width} ${y + height} L${x} ${y + height} Z`;
+    return `M${x + rx} ${y} L${x + width - rx} ${y} Q${x + width} ${y} ${x + width} ${y + ry} L${x + width} ${y + height - ry} Q${x + width} ${y + height} ${x + width - rx} ${y + height} L${x + rx} ${y + height} Q${x} ${y + height} ${x} ${y + height - ry} L${x} ${y + ry} Q${x} ${y} ${x + rx} ${y} Z`;
+  }
+  if (name === "circle" || name === "ellipse") {
+    const cx = numericAttribute(element, "cx"), cy = numericAttribute(element, "cy");
+    const rx = Math.max(0, name === "circle" ? numericAttribute(element, "r") : numericAttribute(element, "rx"));
+    const ry = Math.max(0, name === "circle" ? numericAttribute(element, "r") : numericAttribute(element, "ry"));
+    const k = 0.5522847498307936;
+    return `M${cx + rx} ${cy} C${cx + rx} ${cy + k * ry} ${cx + k * rx} ${cy + ry} ${cx} ${cy + ry} C${cx - k * rx} ${cy + ry} ${cx - rx} ${cy + k * ry} ${cx - rx} ${cy} C${cx - rx} ${cy - k * ry} ${cx - k * rx} ${cy - ry} ${cx} ${cy - ry} C${cx + k * rx} ${cy - ry} ${cx + rx} ${cy - k * ry} ${cx + rx} ${cy} Z`;
+  }
+  return null;
+}
+
+const computedPresentationProperties = [
+  "fill", "fill-opacity", "fill-rule", "stroke", "stroke-opacity", "stroke-width", "stroke-linecap",
+  "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray", "stroke-dashoffset", "opacity", "filter",
+  "clip-path", "mask", "mix-blend-mode", "paint-order", "vector-effect",
+];
+
+function restorePrimitive(original: SVGElement, rendered: SVGPathElement | null) {
+  rendered?.remove();
+  original.style.display = original.getAttribute("data-studio-source-inline-display") || "";
+  original.removeAttribute("data-studio-source-inline-display");
+  original.removeAttribute("data-studio-pose-overridden");
+}
+
+export function applyShapePath(host: HTMLElement, key: string, path: string | null) {
+  const original = host.querySelector(`[data-studio-shape="${CSS.escape(key)}"]`) as SVGElement | null;
+  if (!original) return;
+  const rendered = host.querySelector(`[data-studio-shape-render="${CSS.escape(key)}"]`) as SVGPathElement | null;
+  if (!path) {
+    if (original.localName.toLowerCase() === "path") original.setAttribute("d", original.getAttribute("data-studio-source-d") || "");
+    else restorePrimitive(original, rendered);
+    return;
+  }
+  if (original.localName.toLowerCase() === "path") {
+    original.setAttribute("d", path);
+    return;
+  }
+  let replacement = rendered;
+  if (!replacement) {
+    replacement = document.createElementNS(SVG_NS, "path");
+    for (const attribute of Array.from(original.attributes)) {
+      if (!geometryAttributes.has(attribute.name) && !attribute.name.startsWith("data-studio-")) replacement.setAttribute(attribute.name, attribute.value);
+    }
+    replacement.setAttribute("data-studio-shape-render", key);
+    replacement.setAttribute("data-studio-shape-group", original.getAttribute("data-studio-shape-group") || "");
+    const computed = getComputedStyle(original);
+    for (const property of computedPresentationProperties) {
+      const value = computed.getPropertyValue(property);
+      if (value) replacement.style.setProperty(property, value);
+    }
+    original.parentNode?.insertBefore(replacement, original.nextSibling);
+  }
+  if (!original.hasAttribute("data-studio-source-inline-display")) {
+    original.setAttribute("data-studio-source-inline-display", original.style.display || "");
+  }
+  // Remove the source primitive from group bounds while its pose-local path is active.
+  original.style.display = "none";
+  original.setAttribute("data-studio-pose-overridden", "true");
+  replacement.setAttribute("d", path);
+}
+
+export function applyShapePaths(host: HTMLElement, paths: Record<string, string>) {
+  const originals = Array.from(host.querySelectorAll("[data-studio-shape]")) as SVGElement[];
+  for (const original of originals) {
+    const key = original.dataset.studioShape;
+    if (key) applyShapePath(host, key, paths[key] ?? null);
+  }
 }
 
 export function setWrapperMatrix(host: HTMLElement, key: string, matrix: number[]) {

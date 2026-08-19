@@ -9,7 +9,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pixel_export::export_png,
             pixel_export::export_tileset,
-            pixel_export::refine_pixel_png,
+            pixel_export::render_pixel_png,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

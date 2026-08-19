@@ -37,12 +37,18 @@ export type BonePoseTransform = {
   scaleY: number;
 };
 
+export type NodeMode = "sharp" | "smooth" | "smart";
+
 export type Pose = {
   id: string;
   name: string;
   transforms: Record<string, GroupTransform>;
   boneTransforms: Record<string, BonePoseTransform>;
   visibility: Record<string, boolean>;
+  /** Pose-local path replacements keyed by a generated studio shape id. */
+  shapePaths: Record<string, string>;
+  /** Affinity-style behavior for editable anchors, keyed by shape then command index. */
+  shapeNodeModes: Record<string, Record<string, NodeMode>>;
 };
 
 export const identityTransform = (): GroupTransform => ({
@@ -100,6 +106,8 @@ export function createPose(
   transforms: Record<string, GroupTransform> = {},
   boneTransforms: Record<string, BonePoseTransform> = {},
   visibility: Record<string, boolean> = {},
+  shapePaths: Record<string, string> = {},
+  shapeNodeModes: Record<string, Record<string, NodeMode>> = {},
 ): Pose {
   return {
     id: crypto.randomUUID(),
@@ -109,5 +117,9 @@ export function createPose(
       Object.entries(boneTransforms).map(([key, value]) => [key, { ...value }]),
     ),
     visibility: { ...visibility },
+    shapePaths: { ...shapePaths },
+    shapeNodeModes: Object.fromEntries(
+      Object.entries(shapeNodeModes).map(([shapeKey, modes]) => [shapeKey, { ...modes }]),
+    ),
   };
 }

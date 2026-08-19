@@ -7,7 +7,7 @@ import {
   type Bone,
   type BonePoseTransform,
 } from "./model";
-import { boneGroupMatrices, boneWorldMap, composeGroupLocalMatrices, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, translateBoneEndpoints, type Matrix } from "./rig";
+import { boneGroupMatrices, boneWorldMap, composeGroupLocalMatrices, dominantSampleOwner, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, translateBoneEndpoints, type Matrix } from "./rig";
 
 const bone: Bone = {
   id: "root",
@@ -135,6 +135,18 @@ describe("automatic group fitting", () => {
     );
     expect(fit!.endX - fit!.startX).toBeCloseTo(-(fit!.endY - fit!.startY), 9);
     expect(Math.hypot(fit!.endX - fit!.startX, fit!.endY - fit!.startY)).toBeCloseTo(33.6, 9);
+  });
+});
+
+describe("automatic group binding", () => {
+  it("selects a group only when it owns most bone samples", () => {
+    expect(dominantSampleOwner([
+      "hand", "hand", "hand", "hand", "hand", "hand", null, "arm", "arm", null,
+    ])).toEqual({ key: "hand", coverage: 0.6 });
+  });
+
+  it("does not bind when no group reaches the overlap threshold", () => {
+    expect(dominantSampleOwner(["hand", "hand", "arm", "arm", null])).toBeNull();
   });
 });
 

@@ -4,22 +4,31 @@
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
   import initStudioCore, { transform_matrix } from "$lib/wasm/studio_core.js";
-  import { composeBoneTransform, createPose, identityBoneTransform, identityTransform, relativeBoneTransform, type Bone, type BonePoseTransform, type GroupTransform, type PixelResizeMode, type Pose, type SvgGroup } from "$lib/editor/model";
-  import { highlightBoneWrapper, prepareSvg, selectWrapper, serializeForExport, setWrapperMatrix, setWrapperVisibility } from "$lib/editor/svg";
+  import { composeBoneTransform, createPose, identityBoneTransform, identityTransform, relativeBoneTransform, type Bone, type BonePoseTransform, type GroupTransform, type NodeMode, type PixelResizeMode, type Pose, type SvgGroup } from "$lib/editor/model";
+  import { applyShapePath, applyShapePaths, highlightBoneWrapper, prepareSvg, selectWrapper, serializeForExport, setWrapperMatrix, setWrapperVisibility, shapeElementToPathData } from "$lib/editor/svg";
   import { loadCanvasKit, rasterizeSvg, renderEncodedPixelPreview, renderPixelPreview } from "$lib/editor/pixel-preview";
-  import { boneDepth, boneGroupMatrices, boneWorldMap, composeGroupLocalMatrices, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, translateBoneEndpoints, wouldCreateCycle, type Matrix } from "$lib/editor/rig";
+  import { boneDepth, boneGroupMatrices, boneWorldMap, composeGroupLocalMatrices, dominantSampleOwner, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, translateBoneEndpoints, wouldCreateCycle, type Matrix } from "$lib/editor/rig";
   import { appendHistory, cloneSerializable, snapshotsEqual, type HistoryEntry } from "$lib/editor/history";
   import { decodeAstdProject, encodeAstdProject, type AstdProjectState } from "$lib/editor/project";
+  import { remapGroupRecord, replacementGroupMap } from "$lib/editor/relink";
+  import { clampCanvasZoom, outputPixelDelta, zoomPanAroundAnchor } from "$lib/editor/viewport";
+  import { addPathNodeAfter, configurePathNode, movePathHandle, nodeIndexForHandle, parsePathData, pathArea, pathControlGuides, pathHandles, removePathNode, serializePathData, type ControlGuide, type PathCommand, type PathHandle } from "$lib/editor/shape";
   import "./studio.css";
 
-  type EditorTool = "move" | "rotate" | "scale";
+  type EditorTool = "move" | "rotate" | "scale" | "shape";
+  type ModalTransformTool = Exclude<EditorTool, "shape">;
   type RigEditMode = "setup" | "pose";
   type BoneGesture = "move" | "rotate-start" | "rotate-end" | "scale-start" | "scale-end";
   type PrimaryView = "vector" | "rig";
-  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; preferredRigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number };
+  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; preferredRigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; pixelContourStrength?: number; pixelDetailFloor?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number; zoom?: number; canvasPan?: { x: number; y: number } };
   type DocumentSnapshot = { poses: Pose[]; bones: Bone[]; setupBoneTransforms: Record<string, BonePoseTransform>; activePoseId: string; selectedGroupKey: string | null; selectedBoneId: string | null };
   type DragState = { pointerId: number; key: string; startPoint: { x: number; y: number }; startTransform: GroupTransform; inverse: DOMMatrix; rootToTool: Matrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number; historyBefore: DocumentSnapshot };
-  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; historyBefore: DocumentSnapshot };
+  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; didMove: boolean; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; historyBefore: DocumentSnapshot };
+  type PanDragState = { pointerId: number; startClient: { x: number; y: number }; startPan: { x: number; y: number } };
+  type GroupHitArea = { key: string; depth: number; area: number; box: { x: number; y: number; width: number; height: number }; rootToLocal: Matrix };
+  type SelectionOverlay = { key: string; x: number; y: number; width: number; height: number; matrix: string; kind: "selection" | "bone" };
+  type ShapeEditor = { shapeKey: string; groupKey: string; d: string; sourceD: string; commands: PathCommand[]; handles: PathHandle[]; guides: ControlGuide[]; matrix: string; rootToLocal: Matrix; sourceArea: number; currentArea: number };
+  type ShapeDragState = { pointerId: number; handle: PathHandle; nodeMode: NodeMode; historyBefore: DocumentSnapshot };
 
   const cursorSvg = (body: string, fallback: string, angle = 0) => `url("data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><g transform="rotate(${angle} 16 16)" fill="none" stroke="#f4c96d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="#101416" stroke-width="4" d="${body}"/><path d="${body}"/></g></svg>`)}") 16 16, ${fallback}`;
   const moveCursor = cursorSvg("M16 3l-4 4m4-4l4 4M16 29l-4-4m4 4l4-4M3 16l4-4m-4 4l4 4M29 16l-4-4m4 4l-4 4M16 4v24M4 16h24", "move");
@@ -30,7 +39,9 @@
 
   let svgHost: HTMLDivElement;
   let previewCanvas: HTMLCanvasElement;
+  let primaryViewport: HTMLDivElement;
   let rigSvg = $state<SVGSVGElement>();
+  let vectorOverlay = $state<SVGSVGElement>();
   let fileInput: HTMLInputElement;
   let projectFileInput: HTMLInputElement;
   let sourceSvg = $state("");
@@ -42,13 +53,20 @@
   let activePoseId = $state("rest");
   let selectedGroupKey = $state<string | null>(null);
   let selectedBoneId = $state<string | null>(null);
+  let selectedShapeKey = $state<string | null>(null);
+  let selectedShapeNodeIndex = $state<number | null>(null);
   let outputWidth = $state(64);
   let outputHeight = $state(64);
   let antiAlias = $state(0);
   let resizeMode = $state<PixelResizeMode>("contain");
   let aiPixelFilter = $state(false);
   let aiPaletteSize = $state(16);
+  let pixelContourStrength = $state(60);
+  let pixelDetailFloor = $state(2);
   let activeTool = $state<EditorTool>("move");
+  let modalTool = $state<ModalTransformTool | null>(null);
+  let modalReturnTool: EditorTool = "move";
+  let svgImportMode: "new" | "replace" = "new";
   let lockRatio = $state(true);
   let preserveArea = $state(false);
   let rigEditMode = $state<RigEditMode>("setup");
@@ -58,6 +76,8 @@
   let leftMode = $state<"groups" | "rig">("groups");
   let viewBox = $state<[number, number, number, number]>([0, 0, 512, 512]);
   let zoom = $state(1);
+  let canvasPan = $state({ x: 0, y: 0 });
+  let panDrag = $state<PanDragState | null>(null);
   let status = $state("Ready for an SVG");
   let warnings = $state<string[]>([]);
   let canvasBackend = $state("CanvasKit loading");
@@ -70,8 +90,16 @@
   let playbackTimer: ReturnType<typeof setTimeout> | null = null;
   let drag: DragState | null = null;
   let boneDrag = $state<BoneDragState | null>(null);
+  let shapeDrag = $state<ShapeDragState | null>(null);
+  let selectionOverlay = $state<SelectionOverlay | null>(null);
+  let shapeEditor = $state<ShapeEditor | null>(null);
   let previewTimer: ReturnType<typeof setTimeout> | null = null;
+  let previewRunning = false;
+  let previewQueued = false;
+  let previewRevision = 0;
+  let aiPreviewBusy = $state(false);
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
+  let overlayFrame: number | null = null;
   let setupFrozenMatrices: Record<string, Matrix> = {};
   let undoStack = $state<HistoryEntry<DocumentSnapshot>[]>([]);
   let redoStack = $state<HistoryEntry<DocumentSnapshot>[]>([]);
@@ -89,6 +117,21 @@
   const canEdit = $derived(Boolean(sourceSvg && activePose));
   const frameCount = $derived(poses.length);
   const projectName = $derived(projectPath?.split(/[\\/]/).pop() ?? "UNSAVED .ASTD");
+  const shapeVolumePercent = $derived(shapeEditor && shapeEditor.sourceArea > 1e-8 ? shapeEditor.currentArea / shapeEditor.sourceArea * 100 : 100);
+  const selectedShapeNodeMode = $derived(shapeEditor && selectedShapeNodeIndex !== null
+    ? activePose?.shapeNodeModes?.[shapeEditor.shapeKey]?.[String(selectedShapeNodeIndex)] ?? inferredShapeNodeMode(shapeEditor.commands, selectedShapeNodeIndex)
+    : "sharp");
+
+  function inferredShapeNodeMode(commands: PathCommand[], nodeIndex: number): NodeMode {
+    const anchor = commands[nodeIndex];
+    if (!anchor || anchor.type === "Z") return "sharp";
+    const values = anchor.values;
+    const x = values.at(-2) ?? 0, y = values.at(-1) ?? 0;
+    const incomingVisible = anchor.type === "Q" || (anchor.type === "C" && Math.hypot(values[2] - x, values[3] - y) > 0.001);
+    const outgoing = commands[nodeIndex + 1];
+    const outgoingVisible = outgoing?.type === "Q" || (outgoing?.type === "C" && Math.hypot(outgoing.values[0] - x, outgoing.values[1] - y) > 0.001);
+    return incomingVisible || outgoingVisible ? "smooth" : "sharp";
+  }
 
   onMount(async () => {
     desktopRuntime = isTauri();
@@ -109,7 +152,7 @@
         const migrated = legacy.boneTransforms ?? Object.fromEntries(
           Object.entries(legacy.boneRotations ?? {}).map(([id, rotation]) => [id, { ...identityBoneTransform(), rotation }]),
         );
-        return { ...pose, boneTransforms: migrated, visibility: pose.visibility ?? {} };
+        return { ...pose, boneTransforms: migrated, visibility: pose.visibility ?? {}, shapePaths: pose.shapePaths ?? {}, shapeNodeModes: pose.shapeNodeModes ?? {} };
       });
       bones = session.bones ?? [];
       const restoredActivePoseId = restoredPoses.some((pose) => pose.id === session.activePoseId) ? session.activePoseId : "rest";
@@ -135,12 +178,18 @@
       resizeMode = session.resizeMode === "stretch" ? "stretch" : "contain";
       aiPixelFilter = session.aiPixelFilter === true;
       aiPaletteSize = Math.max(2, Math.min(64, session.aiPaletteSize || 16));
+      pixelContourStrength = Math.max(0, Math.min(100, session.pixelContourStrength ?? 60));
+      pixelDetailFloor = Math.max(1, Math.min(4, session.pixelDetailFloor ?? 2));
       preferredRigEditMode = session.preferredRigEditMode === "pose" || session.rigEditMode === "pose" ? "pose" : "setup";
       rigEditMode = restoredActivePoseId === "rest" ? "setup" : preferredRigEditMode;
       viewMode = session.primaryView === "rig" || session.primaryView === null ? session.primaryView : "vector";
       pixelVisible = session.pixelVisible === true;
       if (!viewMode && !pixelVisible) viewMode = "vector";
       playbackFps = [1, 2, 4, 8].includes(session.playbackFps || 0) ? session.playbackFps! : 2;
+      zoom = Math.max(0.25, Math.min(4, session.zoom ?? 1));
+      canvasPan = Number.isFinite(session.canvasPan?.x) && Number.isFinite(session.canvasPan?.y)
+        ? { x: session.canvasPan!.x, y: session.canvasPan!.y }
+        : { x: 0, y: 0 };
       requestAnimationFrame(() => { if (rigEditMode === "setup") setupFrozenMatrices = calculatedGroupMatrices(); applyAllTransforms(); });
       status = `Restored ${session.fileName}`;
       schedulePersist();
@@ -148,9 +197,11 @@
   });
 
   onDestroy(() => {
+    previewRevision += 1;
     if (previewTimer) clearTimeout(previewTimer);
     if (persistTimer) clearTimeout(persistTimer);
     if (playbackTimer) clearTimeout(playbackTimer);
+    if (overlayFrame !== null) cancelAnimationFrame(overlayFrame);
   });
 
   function isTauri() { return "__TAURI_INTERNALS__" in window; }
@@ -217,6 +268,82 @@
     return composeGroupLocalMatrices(groups, wrapperParentMatrices, rigMatrices, directMatrices);
   }
   function calculatedGroupMatrices(): Record<string, Matrix> { return calculatedGroupMatricesFor(activePose); }
+  function matrixText(matrix: DOMMatrix): string {
+    return `matrix(${matrix.a} ${matrix.b} ${matrix.c} ${matrix.d} ${matrix.e} ${matrix.f})`;
+  }
+  function relativeSvgMatrix(element: SVGGraphicsElement, root: SVGSVGElement): DOMMatrix | null {
+    const rootMatrix = root.getCTM();
+    const elementMatrix = element.getCTM();
+    return rootMatrix && elementMatrix ? rootMatrix.inverse().multiply(elementMatrix) : null;
+  }
+  function editableShapesForGroup(key: string): SVGGraphicsElement[] {
+    return Array.from(svgHost.querySelectorAll(`[data-studio-shape-group="${CSS.escape(key)}"][data-studio-shape]`))
+      .filter((element): element is SVGGraphicsElement => element instanceof SVGGraphicsElement);
+  }
+  function refreshEditorOverlay() {
+    overlayFrame = null;
+    if (!svgHost || !sourceSvg || !viewMode) { selectionOverlay = null; shapeEditor = null; return; }
+    const root = svgHost.querySelector("svg") as SVGSVGElement | null;
+    if (!root) { selectionOverlay = null; shapeEditor = null; return; }
+    const overlayKey = viewMode === "rig" ? selectedBone?.groupKey ?? null : selectedGroupKey;
+    if (overlayKey) {
+      const wrapper = svgHost.querySelector(`[data-studio-group="${CSS.escape(overlayKey)}"]`) as SVGGElement | null;
+      const relative = wrapper ? relativeSvgMatrix(wrapper, root) : null;
+      if (wrapper && relative) {
+        try {
+          const box = wrapper.getBBox();
+          selectionOverlay = { key: overlayKey, x: box.x, y: box.y, width: box.width, height: box.height, matrix: matrixText(relative), kind: viewMode === "rig" ? "bone" : "selection" };
+        } catch { selectionOverlay = null; }
+      } else selectionOverlay = null;
+    } else selectionOverlay = null;
+
+    if (viewMode !== "vector" || activeTool !== "shape" || !selectedGroupKey || shapeDrag) {
+      if (!shapeDrag) shapeEditor = null;
+      return;
+    }
+    const candidates = editableShapesForGroup(selectedGroupKey);
+    const requested = selectedShapeKey ? candidates.find((element) => element.dataset.studioShape === selectedShapeKey) : null;
+    const target = requested ?? candidates.sort((left, right) => {
+      try {
+        const leftGeometry = (svgHost.querySelector(`[data-studio-shape-render="${CSS.escape(left.dataset.studioShape || "")}"]`) as SVGGraphicsElement | null) ?? left;
+        const rightGeometry = (svgHost.querySelector(`[data-studio-shape-render="${CSS.escape(right.dataset.studioShape || "")}"]`) as SVGGraphicsElement | null) ?? right;
+        const a = leftGeometry.getBBox(), b = rightGeometry.getBBox();
+        return b.width * b.height - a.width * a.height;
+      }
+      catch { return 0; }
+    })[0];
+    const key = target?.dataset.studioShape;
+    if (!target || !key) { shapeEditor = null; return; }
+    const sourceD = shapeElementToPathData(target);
+    const geometry = (svgHost.querySelector(`[data-studio-shape-render="${CSS.escape(key)}"]`) as SVGGraphicsElement | null) ?? target;
+    const relative = relativeSvgMatrix(geometry, root);
+    if (!sourceD || !relative) { shapeEditor = null; return; }
+    try {
+      const d = activePose?.shapePaths?.[key] ?? sourceD;
+      const commands = parsePathData(d);
+      selectedShapeKey = key;
+      shapeEditor = {
+        shapeKey: key,
+        groupKey: selectedGroupKey,
+        d,
+        sourceD,
+        commands,
+        handles: pathHandles(commands),
+        guides: pathControlGuides(commands),
+        matrix: matrixText(relative),
+        rootToLocal: [relative.inverse().a, relative.inverse().b, relative.inverse().c, relative.inverse().d, relative.inverse().e, relative.inverse().f],
+        sourceArea: pathArea(parsePathData(sourceD)),
+        currentArea: pathArea(commands),
+      };
+    } catch (error) {
+      console.warn("Unable to expose SVG path nodes", error);
+      shapeEditor = null;
+    }
+  }
+  function scheduleEditorOverlay() {
+    if (overlayFrame !== null) cancelAnimationFrame(overlayFrame);
+    overlayFrame = requestAnimationFrame(refreshEditorOverlay);
+  }
   function applyAllTransforms() {
     if (!svgHost) return;
     const calculated = calculatedGroupMatrices();
@@ -225,8 +352,10 @@
       setWrapperMatrix(svgHost, group.key, freezeRig && setupFrozenMatrices[group.key] ? setupFrozenMatrices[group.key] : calculated[group.key]);
       setWrapperVisibility(svgHost, group.key, groupIsVisible(group.key));
     }
+    applyShapePaths(svgHost, activePose?.shapePaths ?? {});
     selectWrapper(svgHost, selectedGroupKey);
     highlightBoneWrapper(svgHost, selectedBone?.groupKey ?? null);
+    scheduleEditorOverlay();
     schedulePreview();
   }
   function setRigEditMode(mode: RigEditMode) {
@@ -240,6 +369,7 @@
     viewMode = "rig"; leftMode = "rig"; applyAllTransforms();
   }
   function togglePrimaryView(mode: PrimaryView) {
+    if (modalTool) exitModalTransform(false);
     if (viewMode === mode && pixelVisible) {
       viewMode = null;
     } else {
@@ -256,6 +386,59 @@
     if (!pixelVisible && !viewMode) viewMode = "vector";
     if (pixelVisible) schedulePreview();
     schedulePersist();
+  }
+  function setCanvasZoom(value: number, anchor?: { x: number; y: number }) {
+    const next = clampCanvasZoom(value);
+    if (Math.abs(next - zoom) < 1e-6) return;
+    if (anchor && primaryViewport) {
+      const rect = primaryViewport.getBoundingClientRect();
+      const origin = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      const result = zoomPanAroundAnchor(zoom, next, canvasPan, anchor, origin);
+      canvasPan = result.pan;
+    }
+    zoom = next;
+    schedulePersist();
+  }
+  function canvasWheel(event: WheelEvent) {
+    if (!viewMode) return;
+    event.preventDefault();
+    const factor = Math.exp(-event.deltaY * 0.0015);
+    setCanvasZoom(zoom * factor, { x: event.clientX, y: event.clientY });
+    status = `Canvas zoom · ${Math.round(zoom * 100)}%`;
+  }
+  function viewportPointerDown(event: PointerEvent) {
+    if (viewMode && modalTool && event.button === 0 && !(event.target as Element).closest(".artboard-wrap")) {
+      if (viewMode === "rig" && selectedBoneId) {
+        const gesture: BoneGesture = modalTool === "move" ? "move" : modalTool === "rotate" ? "rotate-end" : "scale-end";
+        bonePointerDown(event, selectedBoneId, gesture);
+      } else if (viewMode === "vector") {
+        pointerDown(event);
+      }
+      return;
+    }
+    if (!viewMode || event.button !== 1) return;
+    panDrag = {
+      pointerId: event.pointerId,
+      startClient: { x: event.clientX, y: event.clientY },
+      startPan: { ...canvasPan },
+    };
+    primaryViewport.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+  function viewportPointerMove(event: PointerEvent) {
+    if (!panDrag || panDrag.pointerId !== event.pointerId) return;
+    canvasPan = {
+      x: panDrag.startPan.x + event.clientX - panDrag.startClient.x,
+      y: panDrag.startPan.y + event.clientY - panDrag.startClient.y,
+    };
+    event.preventDefault();
+  }
+  function viewportPointerUp(event: PointerEvent) {
+    if (!panDrag || panDrag.pointerId !== event.pointerId) return;
+    panDrag = null;
+    schedulePersist();
+    status = `Canvas panned · ${Math.round(canvasPan.x)}, ${Math.round(canvasPan.y)}`;
+    event.preventDefault();
   }
   function collectPivots() {
     const root = svgHost.querySelector("svg");
@@ -288,26 +471,81 @@
   async function loadSvgSource(svg: string, name: string, persist = true) {
     const prepared = prepareSvg(svg);
     sourceSvg = svg; fileName = name; groups = prepared.groups; warnings = prepared.warnings; viewBox = prepared.viewBox;
-    selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; poses = []; bones = []; setupBoneTransforms = {}; activePoseId = "rest"; undoStack = []; redoStack = []; projectPath = null;
+    selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; selectedShapeKey = null; selectedShapeNodeIndex = null; poses = []; bones = []; setupBoneTransforms = {}; activePoseId = "rest"; undoStack = []; redoStack = []; projectPath = null; zoom = 1; canvasPan = { x: 0, y: 0 };
     svgHost.innerHTML = prepared.markup;
     requestAnimationFrame(() => { collectPivots(); applyAllTransforms(); });
     status = `${groups.length} editable group${groups.length === 1 ? "" : "s"} indexed`;
     dirty = persist;
     if (persist) schedulePersist();
   }
-  async function openSvg() {
+  async function replaceSvgSource(svg: string, name: string) {
+    const prepared = prepareSvg(svg);
+    const mapping = replacementGroupMap(groups, prepared.groups);
+    const mappedBindings = bones.filter((bone) => bone.groupKey && mapping[bone.groupKey]).length;
+    const previousBindingCount = bones.filter((bone) => bone.groupKey).length;
+    const previousSelection = selectedGroupKey;
+
+    sourceSvg = svg;
+    fileName = name;
+    groups = prepared.groups;
+    warnings = prepared.warnings;
+    viewBox = prepared.viewBox;
+    bones = bones.map((bone) => ({
+      ...bone,
+      groupKey: bone.groupKey ? mapping[bone.groupKey] ?? null : null,
+    }));
+    poses = poses.map((pose) => ({
+      ...pose,
+      transforms: remapGroupRecord(pose.transforms, mapping),
+      visibility: remapGroupRecord(pose.visibility, mapping),
+    }));
+    selectedGroupKey = previousSelection ? mapping[previousSelection] ?? prepared.groups[0]?.key ?? null : prepared.groups[0]?.key ?? null;
+    selectedShapeKey = null;
+    selectedShapeNodeIndex = null;
+    undoStack = [];
+    redoStack = [];
+    drag = null;
+    boneDrag = null;
+    modalTool = null;
+    setupFrozenMatrices = {};
+    svgHost.innerHTML = prepared.markup;
+    requestAnimationFrame(() => {
+      collectPivots();
+      applyAllTransforms();
+      selectWrapper(svgHost, selectedGroupKey);
+      if (selectedBoneId) highlightBoneWrapper(svgHost, bones.find((bone) => bone.id === selectedBoneId)?.groupKey ?? null);
+    });
+    dirty = true;
+    schedulePersist();
+    schedulePreview();
+    const lost = previousBindingCount - mappedBindings;
+    status = `SVG replaced · ${mappedBindings}/${previousBindingCount} rig binding${previousBindingCount === 1 ? "" : "s"} relinked${lost ? ` · ${lost} needs review` : ""}`;
+  }
+  async function chooseSvg(mode: "new" | "replace") {
     try {
       if (isTauri()) {
         const path = await open({ multiple: false, directory: false, filters: [{ name: "Scalable Vector Graphics", extensions: ["svg"] }] });
         if (!path) return;
-        await loadSvgSource(await readTextFile(path), path.split(/[\\/]/).pop() || "artwork.svg");
-      } else fileInput.click();
+        const svg = await readTextFile(path);
+        const name = path.split(/[\\/]/).pop() || "artwork.svg";
+        if (mode === "replace" && sourceSvg) await replaceSvgSource(svg, name);
+        else await loadSvgSource(svg, name);
+      } else {
+        svgImportMode = mode;
+        fileInput.click();
+      }
     } catch (error) { status = error instanceof Error ? error.message : String(error); }
   }
+  async function openSvg() { await chooseSvg(sourceSvg ? "replace" : "new"); }
+  async function newProject() { await chooseSvg("new"); }
   async function receiveFile(event: Event) {
     const input = event.currentTarget as HTMLInputElement, file = input.files?.[0];
     if (!file) return;
-    try { await loadSvgSource(await file.text(), file.name); }
+    try {
+      const svg = await file.text();
+      if (svgImportMode === "replace" && sourceSvg) await replaceSvgSource(svg, file.name);
+      else await loadSvgSource(svg, file.name);
+    }
     catch (error) { status = error instanceof Error ? error.message : String(error); }
     finally { input.value = ""; }
   }
@@ -327,6 +565,8 @@
       resizeMode,
       aiPixelFilter,
       aiPaletteSize,
+      pixelContourStrength,
+      pixelDetailFloor,
       preferredRigEditMode,
       primaryView: viewMode,
       pixelVisible,
@@ -346,12 +586,13 @@
     selectedBoneId = bones.some((bone) => bone.id === saved.selectedBoneId) ? saved.selectedBoneId : null;
     outputWidth = saved.outputWidth; outputHeight = saved.outputHeight; antiAlias = saved.antiAlias; resizeMode = saved.resizeMode;
     aiPixelFilter = saved.aiPixelFilter; aiPaletteSize = saved.aiPaletteSize;
+    pixelContourStrength = saved.pixelContourStrength; pixelDetailFloor = saved.pixelDetailFloor;
     preferredRigEditMode = saved.preferredRigEditMode;
     rigEditMode = activePoseId === "rest" ? "setup" : preferredRigEditMode;
     viewMode = saved.primaryView; pixelVisible = saved.pixelVisible;
     if (!viewMode && !pixelVisible) viewMode = "vector";
     leftMode = viewMode === "rig" ? "rig" : "groups";
-    playbackFps = saved.playbackFps; zoom = saved.zoom;
+    playbackFps = saved.playbackFps; zoom = saved.zoom; canvasPan = { x: 0, y: 0 };
     projectPath = pathOrName; undoStack = []; redoStack = []; dirty = false;
     requestAnimationFrame(() => {
       collectPivots();
@@ -398,11 +639,22 @@
       dirty = false; status = `Project saved · ${projectName}`; schedulePersist();
     } catch (error) { status = error instanceof Error ? error.message : String(error); }
   }
-  function selectGroup(key: string) { selectedGroupKey = key; selectWrapper(svgHost, key); }
+  function selectGroup(key: string, shapeKey: string | null = null): boolean {
+    if (modalTool && selectedGroupKey !== key) {
+      status = `${modalTool.toUpperCase()} is locked to ${selectedGroup?.label ?? "the current vector"} · press Esc to change selection`;
+      return false;
+    }
+    selectedGroupKey = key;
+    if (shapeKey !== selectedShapeKey) selectedShapeNodeIndex = null;
+    selectedShapeKey = shapeKey;
+    selectWrapper(svgHost, key);
+    scheduleEditorOverlay();
+    return true;
+  }
   function addPose() {
     if (!sourceSvg) return;
     const before = captureDocument();
-    const pose = createPose(`Pose ${String(poses.length + 1).padStart(2, "0")}`, activePose?.transforms ?? {}, activePose?.boneTransforms ?? {}, activePose?.visibility ?? {});
+    const pose = createPose(`Pose ${String(poses.length + 1).padStart(2, "0")}`, activePose?.transforms ?? {}, activePose?.boneTransforms ?? {}, activePose?.visibility ?? {}, activePose?.shapePaths ?? {}, activePose?.shapeNodeModes ?? {});
     poses = [...poses, pose]; activePoseId = pose.id; rigEditMode = preferredRigEditMode; dirty = false; applyAllTransforms(); schedulePersist();
     commitHistory("Create pose", before);
     status = `${pose.name} created as an independent pose`;
@@ -410,7 +662,7 @@
   function duplicatePose() {
     if (!activePose) return;
     const before = captureDocument();
-    const pose = createPose(`${activePose.name} copy`, activePose.transforms, activePose.boneTransforms, activePose.visibility);
+    const pose = createPose(`${activePose.name} copy`, activePose.transforms, activePose.boneTransforms, activePose.visibility, activePose.shapePaths, activePose.shapeNodeModes);
     poses = [...poses, pose]; activePoseId = pose.id; rigEditMode = preferredRigEditMode; dirty = false; applyAllTransforms(); schedulePersist();
     commitHistory("Duplicate pose", before);
   }
@@ -495,13 +747,145 @@
   }
   function resetSelected() {
     if (!selectedGroupKey || !activePose) return;
+    if (activeTool === "shape" && shapeEditor) { resetSelectedShape(); return; }
     const pivot = pivots[selectedGroupKey] ?? { x: 0, y: 0 };
     updateTransform(selectedGroupKey, { ...identityTransform(), pivotX: pivot.x, pivotY: pivot.y });
   }
-  function selectBone(id: string) {
+  function currentShapeNodeModes(): Record<string, NodeMode> {
+    if (!activePose || !shapeEditor) return {};
+    return { ...(activePose.shapeNodeModes?.[shapeEditor.shapeKey] ?? {}) };
+  }
+  function updateShapeCommands(commands: PathCommand[], nodeModes?: Record<string, NodeMode>) {
+    if (!activePose || !shapeEditor) return;
+    const d = serializePathData(commands);
+    const shapeKey = shapeEditor.shapeKey;
+    poses = poses.map((pose) => pose.id === activePose.id
+      ? {
+        ...pose,
+        shapePaths: { ...(pose.shapePaths ?? {}), [shapeKey]: d },
+        shapeNodeModes: nodeModes
+          ? { ...(pose.shapeNodeModes ?? {}), [shapeKey]: { ...nodeModes } }
+          : pose.shapeNodeModes ?? {},
+      }
+      : pose);
+    applyShapePath(svgHost, shapeKey, d);
+    shapeEditor = {
+      ...shapeEditor,
+      d,
+      commands,
+      handles: pathHandles(commands),
+      guides: pathControlGuides(commands),
+      currentArea: pathArea(commands),
+    };
+    dirty = true;
+    scheduleEditorOverlay();
+    schedulePreview();
+    schedulePersist();
+  }
+  function shiftNodeModes(modes: Record<string, NodeMode>, pivot: number, delta: 1 | -1): Record<string, NodeMode> {
+    return Object.fromEntries(Object.entries(modes).flatMap(([key, mode]) => {
+      const index = Number(key);
+      if (!Number.isInteger(index)) return [];
+      if (delta === 1) return [[String(index >= pivot ? index + 1 : index), mode]];
+      if (index === pivot) return [];
+      return [[String(index > pivot ? index - 1 : index), mode]];
+    }));
+  }
+  function addShapeNode() {
+    if (!activePose || !shapeEditor || selectedShapeNodeIndex === null) { status = "Select an anchor before adding a node."; return; }
+    const result = addPathNodeAfter(shapeEditor.commands, selectedShapeNodeIndex);
+    if (!result) { status = "This segment cannot accept another node."; return; }
+    const before = captureDocument();
+    const inheritedMode = selectedShapeNodeMode;
+    const modes = shiftNodeModes(currentShapeNodeModes(), result.nodeIndex, 1);
+    modes[String(result.nodeIndex)] = inheritedMode;
+    selectedShapeNodeIndex = result.nodeIndex;
+    updateShapeCommands(result.commands, modes);
+    commitHistory("Add vector node", before);
+    status = `Node added without changing the curve · ${shapeVolumePercent.toFixed(1)}% volume`;
+  }
+  function removeSelectedShapeNode() {
+    if (!activePose || !shapeEditor || selectedShapeNodeIndex === null) { status = "Select an anchor before removing a node."; return; }
+    const result = removePathNode(shapeEditor.commands, selectedShapeNodeIndex);
+    if (!result) { status = "A closed shape needs at least three nodes."; return; }
+    const before = captureDocument();
+    const removedIndex = selectedShapeNodeIndex;
+    const modes = shiftNodeModes(currentShapeNodeModes(), removedIndex, -1);
+    selectedShapeNodeIndex = result.nodeIndex;
+    updateShapeCommands(result.commands, modes);
+    commitHistory("Remove vector node", before);
+    status = `Node removed · ${shapeVolumePercent.toFixed(1)}% volume`;
+  }
+  function setSelectedShapeNodeMode(mode: NodeMode) {
+    if (!activePose || !shapeEditor || selectedShapeNodeIndex === null) { status = "Select an anchor to change its behavior."; return; }
+    const before = captureDocument();
+    const modes = currentShapeNodeModes();
+    modes[String(selectedShapeNodeIndex)] = mode;
+    const commands = configurePathNode(shapeEditor.commands, selectedShapeNodeIndex, mode);
+    updateShapeCommands(commands, modes);
+    commitHistory(`Convert node to ${mode}`, before);
+    status = mode === "sharp" ? "Corner node · pullers removed" : mode === "smooth" ? "Smooth node · two independent pullers" : "Smart node · two linked pullers stay aligned and balanced";
+  }
+  function resetSelectedShape() {
+    if (!activePose || !shapeEditor) return;
+    const before = captureDocument();
+    const shapeKey = shapeEditor.shapeKey;
+    poses = poses.map((pose) => {
+      if (pose.id !== activePose.id) return pose;
+      const shapePaths = { ...(pose.shapePaths ?? {}) };
+      const shapeNodeModes = { ...(pose.shapeNodeModes ?? {}) };
+      delete shapePaths[shapeKey];
+      delete shapeNodeModes[shapeKey];
+      return { ...pose, shapePaths, shapeNodeModes };
+    });
+    applyShapePath(svgHost, shapeKey, null);
+    commitHistory("Reset vector shape", before);
+    dirty = true;
+    scheduleEditorOverlay();
+    schedulePreview();
+    schedulePersist();
+    status = "Vector shape restored to 100% source volume";
+  }
+  function selectEditorTool(tool: EditorTool) {
+    if (modalTool) exitModalTransform(false);
+    activeTool = tool;
+    scheduleEditorOverlay();
+    status = tool === "shape" ? "Node tool · select a shape, then drag anchors or Bézier controls" : `${tool[0].toUpperCase()}${tool.slice(1)} tool`;
+  }
+  function enterModalTransform(tool: ModalTransformTool) {
+    if (!viewMode) { status = "Open Vector or Rig before starting a transform."; return; }
+    if (viewMode === "rig" && !selectedBone) { status = `Select a bone before pressing ${tool === "move" ? "G" : tool === "rotate" ? "R" : "S"}.`; return; }
+    if (viewMode === "vector" && !selectedGroup) { status = `Select a vector group before pressing ${tool === "move" ? "G" : tool === "rotate" ? "R" : "S"}.`; return; }
+    if (viewMode === "vector" && !activePose) { status = "REST is protected. Create or select a pose before transforming artwork."; return; }
+    if (!modalTool) modalReturnTool = activeTool;
+    modalTool = tool;
+    activeTool = tool;
+    scheduleEditorOverlay();
+    status = `${tool.toUpperCase()} LOCKED · drag anywhere on the canvas · Esc to exit`;
+  }
+  function exitModalTransform(cancelGesture: boolean) {
+    if (cancelGesture) {
+      const before = drag?.historyBefore ?? boneDrag?.historyBefore;
+      if (before) restoreDocument(before);
+      drag = null;
+      boneDrag = null;
+    }
+    if (!modalTool) return;
+    const exited = modalTool;
+    modalTool = null;
+    activeTool = modalReturnTool;
+    scheduleEditorOverlay();
+    status = `${exited.toUpperCase()} lock released`;
+  }
+  function selectBone(id: string): boolean {
+    if (modalTool && selectedBoneId !== id) {
+      status = `${modalTool.toUpperCase()} is locked to ${selectedBone?.name ?? "the current bone"} · press Esc to change selection`;
+      return false;
+    }
     selectedBoneId = id;
     highlightBoneWrapper(svgHost, bones.find((bone) => bone.id === id)?.groupKey ?? null);
     if (viewMode !== "rig") showRig(); else leftMode = "rig";
+    return true;
   }
   function fittedBoneForGroup(bone: Bone, groupKey: string): { bone: Bone; setup: BonePoseTransform } | null {
     const wrapper = svgHost?.querySelector(`[data-studio-group="${CSS.escape(groupKey)}"]`) as SVGGElement | null;
@@ -545,6 +929,70 @@
     } catch {
       return null;
     }
+  }
+  function currentGroupHitAreas(): GroupHitArea[] {
+    const root = svgHost.querySelector("svg");
+    const rootInverse = root?.getCTM()?.inverse();
+    if (!rootInverse) return [];
+    return groups.flatMap((group) => {
+      if (!groupIsVisible(group.key)) return [];
+      const wrapper = svgHost.querySelector(`[data-studio-group="${CSS.escape(group.key)}"]`) as SVGGElement | null;
+      const wrapperCtm = wrapper?.getCTM();
+      if (!wrapper || !wrapperCtm) return [];
+      try {
+        const box = wrapper.getBBox();
+        if (box.width <= 0 || box.height <= 0) return [];
+        const relative = rootInverse.multiply(wrapperCtm);
+        const localToRoot: Matrix = [relative.a, relative.b, relative.c, relative.d, relative.e, relative.f];
+        const determinant = Math.abs(localToRoot[0] * localToRoot[3] - localToRoot[1] * localToRoot[2]);
+        return [{
+          key: group.key,
+          depth: group.depth,
+          area: box.width * box.height * Math.max(1e-6, determinant),
+          box: { x: box.x, y: box.y, width: box.width, height: box.height },
+          rootToLocal: invertMatrix(localToRoot),
+        }];
+      } catch {
+        return [];
+      }
+    }).sort((left, right) => right.depth - left.depth || left.area - right.area);
+  }
+  function groupAtBoneSample(point: { x: number; y: number }, areas: GroupHitArea[]): string | null {
+    for (const area of areas) {
+      const local = pointWithMatrix(area.rootToLocal, point.x, point.y);
+      if (local.x >= area.box.x && local.x <= area.box.x + area.box.width
+        && local.y >= area.box.y && local.y <= area.box.y + area.box.height) return area.key;
+    }
+    return null;
+  }
+  function dominantGroupForBone(world: { startX: number; startY: number; endX: number; endY: number }): { key: string; coverage: number } | null {
+    const sampleCount = 25;
+    const areas = currentGroupHitAreas();
+    const owners = Array.from({ length: sampleCount }, (_, index) => {
+      const amount = index / (sampleCount - 1);
+      return groupAtBoneSample({
+        x: world.startX + (world.endX - world.startX) * amount,
+        y: world.startY + (world.endY - world.startY) * amount,
+      }, areas);
+    });
+    return dominantSampleOwner(owners, 0.6);
+  }
+  function autoBindMovedBone(boneId: string): string | null {
+    if (rigEditMode !== "setup") return null;
+    const bone = bones.find((item) => item.id === boneId);
+    const world = boneWorlds[boneId];
+    if (!bone || !world) return null;
+    const overlap = dominantGroupForBone(world);
+    if (!overlap || overlap.key === bone.groupKey) return null;
+    const fitted = fittedBoneForGroup({ ...bone, groupKey: overlap.key }, overlap.key);
+    if (!fitted) return null;
+    bones = bones.map((item) => item.id === boneId
+      ? fitted.bone
+      : item.groupKey === overlap.key ? { ...item, groupKey: null } : item);
+    setupBoneTransforms = { ...setupBoneTransforms, [boneId]: fitted.setup };
+    selectedGroupKey = overlap.key;
+    applyAllTransforms(); schedulePersist();
+    return groups.find((group) => group.key === overlap.key)?.label ?? overlap.key;
   }
   function fitSelectedBoneToGroup() {
     if (!selectedBone?.groupKey || rigEditMode !== "setup") return;
@@ -726,7 +1174,8 @@
     else updateBonePose(state.boneId, relativeBoneTransform(effective, state.startSetup), false, false);
   }
   function bonePointerDown(event: PointerEvent, boneId: string, gesture: BoneGesture) {
-    selectBone(boneId);
+    if (event.button !== 0) return;
+    if (!selectBone(boneId)) return;
     if (rigEditMode === "pose" && !activePose) { status = "Create a pose before entering Pose mode."; return; }
     const inverse = rigSvg?.getScreenCTM()?.inverse();
     if (!inverse) return;
@@ -741,6 +1190,7 @@
       gesture,
       inverse,
       startPoint,
+      didMove: false,
       startBone: { ...bone },
       startSetup: { ...currentSetupBoneTransform(boneId) },
       startPose: { ...currentBoneTransform(boneId) },
@@ -753,6 +1203,13 @@
     event.preventDefault(); event.stopPropagation();
   }
   function boneOverlayPointerDown(event: PointerEvent) {
+    if (event.button !== 0) return;
+    if (modalTool) {
+      if (!selectedBoneId) return;
+      const gesture: BoneGesture = modalTool === "move" ? "move" : modalTool === "rotate" ? "rotate-end" : "scale-end";
+      bonePointerDown(event, selectedBoneId, gesture);
+      return;
+    }
     const target = (event.target as Element).closest<SVGElement>("[data-bone-gesture]");
     const boneId = target?.dataset.boneId;
     const gesture = target?.dataset.boneGesture as BoneGesture | undefined;
@@ -763,6 +1220,7 @@
     const bone = bones.find((item) => item.id === boneDrag?.boneId);
     if (!bone) return;
     const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(boneDrag.inverse);
+    if (Math.hypot(point.x - boneDrag.startPoint.x, point.y - boneDrag.startPoint.y) >= 0.5) boneDrag.didMove = true;
     const start = boneDrag.startWorld;
     const dx = start.endX - start.startX;
     const dy = start.endY - start.startY;
@@ -773,14 +1231,19 @@
       const translated = translateBoneEndpoints(start, delta);
       applyBoneGeometry(boneDrag, translated.start, translated.end);
     } else if (boneDrag.gesture === "rotate-end") {
-      const angle = Math.atan2(point.y - start.startY, point.x - start.startX);
+      const baseAngle = Math.atan2(dy, dx);
+      const startPointerAngle = Math.atan2(boneDrag.startPoint.y - start.startY, boneDrag.startPoint.x - start.startX);
+      const currentPointerAngle = Math.atan2(point.y - start.startY, point.x - start.startX);
+      const angle = modalTool === "rotate" ? baseAngle + currentPointerAngle - startPointerAngle : currentPointerAngle;
       applyBoneGeometry(boneDrag, { x: start.startX, y: start.startY }, { x: start.startX + Math.cos(angle) * length, y: start.startY + Math.sin(angle) * length });
     } else if (boneDrag.gesture === "rotate-start") {
       const angleFromEnd = Math.atan2(point.y - start.endY, point.x - start.endX);
       const worldStart = { x: start.endX + Math.cos(angleFromEnd) * length, y: start.endY + Math.sin(angleFromEnd) * length };
       applyBoneGeometry(boneDrag, worldStart, { x: start.endX, y: start.endY });
     } else if (boneDrag.gesture === "scale-end") {
-      const nextLength = Math.max(1, (point.x - start.startX) * unit.x + (point.y - start.startY) * unit.y);
+      const nextLength = modalTool === "scale"
+        ? Math.max(1, length + (point.x - boneDrag.startPoint.x) * unit.x + (point.y - boneDrag.startPoint.y) * unit.y)
+        : Math.max(1, (point.x - start.startX) * unit.x + (point.y - start.startY) * unit.y);
       applyBoneGeometry(boneDrag, { x: start.startX, y: start.startY }, { x: start.startX + unit.x * nextLength, y: start.startY + unit.y * nextLength });
     } else {
       const nextLength = Math.max(1, (start.endX - point.x) * unit.x + (start.endY - point.y) * unit.y);
@@ -789,15 +1252,34 @@
   }
   function bonePointerUp(event: PointerEvent) {
     if (!boneDrag || boneDrag.pointerId !== event.pointerId) return;
-    const before = boneDrag.historyBefore;
-    boneDrag = null; commitHistory("Transform bone", before); schedulePreview(); status = rigEditMode === "setup" ? "Guide placement updated; artwork remains frozen" : `${activePose?.name ?? "Pose"} rig transform updated`;
+    const completed = boneDrag;
+    const before = completed.historyBefore;
+    const autoBoundGroup = completed.gesture === "move" && completed.didMove ? autoBindMovedBone(completed.boneId) : null;
+    boneDrag = null;
+    commitHistory(autoBoundGroup ? "Move, bind, and fit bone" : "Transform bone", before);
+    schedulePreview();
+    status = autoBoundGroup
+      ? `Auto-bound and fitted to ${autoBoundGroup}`
+      : rigEditMode === "setup" ? "Guide placement updated; artwork remains frozen" : `${activePose?.name ?? "Pose"} rig transform updated`;
   }
   function pointerDown(event: PointerEvent) {
+    if (event.button !== 0) return;
     if (viewMode === "rig") return;
-    const wrapper = (event.target as Element).closest("[data-studio-group]") as SVGGElement | null;
-    const key = wrapper?.dataset.studioGroup;
+    const hitWrapper = (event.target as Element).closest("[data-studio-group]") as SVGGElement | null;
+    const hitKey = hitWrapper?.dataset.studioGroup;
+    const key = modalTool ? selectedGroupKey : hitKey;
+    const wrapper = key ? svgHost.querySelector(`[data-studio-group="${CSS.escape(key)}"]`) as SVGGElement | null : null;
     if (!wrapper || !key) return;
-    selectGroup(key);
+    if (!modalTool) {
+      const shapeTarget = (event.target as Element).closest("[data-studio-shape],[data-studio-shape-render]") as SVGElement | null;
+      const shapeKey = shapeTarget?.dataset.studioShape ?? shapeTarget?.dataset.studioShapeRender ?? null;
+      if (!selectGroup(key, shapeKey)) return;
+    }
+    if (activeTool === "shape") {
+      status = activePose ? "Shape selected · drag a node to reshape this pose" : "REST is protected. Create a pose before reshaping artwork.";
+      event.preventDefault();
+      return;
+    }
     if (!activePose) { status = "REST is protected. Create a pose before moving artwork."; return; }
     const rootSvg = svgHost.querySelector("svg");
     const inverse = rootSvg?.getScreenCTM()?.inverse();
@@ -843,6 +1325,73 @@
     const before = drag.historyBefore;
     drag = null; commitHistory("Transform group", before); schedulePreview(); status = `${activePose?.name ?? "Pose"} updated`;
   }
+  function shapePointerDown(event: PointerEvent) {
+    if (event.button !== 0 || !shapeEditor || !activePose || !vectorOverlay) return;
+    const handleElement = (event.target as Element).closest("[data-shape-handle]") as SVGElement | null;
+    const handle = shapeEditor.handles.find((candidate) => candidate.id === handleElement?.dataset.shapeHandle);
+    if (!handle) return;
+    const nodeIndex = nodeIndexForHandle(shapeEditor.commands, handle);
+    const nodeMode = activePose.shapeNodeModes?.[shapeEditor.shapeKey]?.[String(nodeIndex)] ?? inferredShapeNodeMode(shapeEditor.commands, nodeIndex);
+    selectedShapeNodeIndex = nodeIndex;
+    shapeDrag = { pointerId: event.pointerId, handle, nodeMode, historyBefore: captureDocument() };
+    vectorOverlay.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+    event.preventDefault();
+  }
+  function shapePointerMove(event: PointerEvent) {
+    if (!shapeDrag || shapeDrag.pointerId !== event.pointerId || !shapeEditor || !vectorOverlay) return;
+    const inverse = vectorOverlay.getScreenCTM()?.inverse();
+    if (!inverse) return;
+    const rootPoint = new DOMPoint(event.clientX, event.clientY).matrixTransform(inverse);
+    const localPoint = pointWithMatrix(shapeEditor.rootToLocal, rootPoint.x, rootPoint.y);
+    const currentHandle = shapeEditor.handles.find((candidate) => candidate.id === shapeDrag?.handle.id) ?? shapeDrag.handle;
+    updateShapeCommands(movePathHandle(shapeEditor.commands, currentHandle, localPoint.x, localPoint.y, shapeDrag.nodeMode));
+    event.preventDefault();
+  }
+  function shapePointerUp(event: PointerEvent) {
+    if (!shapeDrag || shapeDrag.pointerId !== event.pointerId) return;
+    const before = shapeDrag.historyBefore;
+    shapeDrag = null;
+    commitHistory("Reshape vector", before);
+    scheduleEditorOverlay();
+    schedulePreview();
+    status = `Vector volume · ${shapeVolumePercent.toFixed(1)}% of source`;
+    event.preventDefault();
+  }
+  function nudgeSelectedBone(horizontalPixels: number, verticalPixels: number) {
+    if (!selectedBone || (rigEditMode === "pose" && !activePose)) return;
+    const world = boneWorlds[selectedBone.id];
+    if (!world) return;
+    const rootDelta = outputPixelDelta(
+      viewBox,
+      { width: outputWidth, height: outputHeight },
+      resizeMode,
+      { x: horizontalPixels, y: verticalPixels },
+    );
+    const parentMatrix = selectedBone.parentId ? boneWorlds[selectedBone.parentId]?.matrix : null;
+    const parentInverse = parentMatrix ? invertMatrix(parentMatrix) : [1, 0, 0, 1, 0, 0] as Matrix;
+    const localStart = pointWithMatrix(parentInverse, world.startX + rootDelta.x, world.startY + rootDelta.y);
+    const localEnd = pointWithMatrix(parentInverse, world.endX + rootDelta.x, world.endY + rootDelta.y);
+    const dx = localEnd.x - localStart.x;
+    const dy = localEnd.y - localStart.y;
+    const currentEffective = effectiveBoneTransform(selectedBone.id);
+    const effective: BonePoseTransform = {
+      x: localStart.x - selectedBone.x,
+      y: localStart.y - selectedBone.y,
+      rotation: Math.atan2(dy, dx) * 180 / Math.PI - selectedBone.restRotation,
+      scaleX: Math.max(0.02, Math.hypot(dx, dy) / Math.max(1, selectedBone.length)),
+      scaleY: currentEffective.scaleY,
+    };
+    const before = captureDocument();
+    if (rigEditMode === "setup") {
+      updateSetupBoneTransform(selectedBone.id, relativeBoneTransform(effective, currentBoneTransform(selectedBone.id)), false, false);
+    } else {
+      updateBonePose(selectedBone.id, relativeBoneTransform(effective, currentSetupBoneTransform(selectedBone.id)), false, false);
+    }
+    const pixelCount = Math.max(Math.abs(horizontalPixels), Math.abs(verticalPixels));
+    commitHistory(`Nudge bone ${pixelCount} pixel${pixelCount === 1 ? "" : "s"}`, before);
+    status = `${selectedBone.name} nudged ${pixelCount} output pixel${pixelCount === 1 ? "" : "s"}`;
+  }
   function keyboardHandler(event: KeyboardEvent) {
     const shortcut = event.ctrlKey || event.metaKey;
     const shortcutKey = event.key.toLowerCase();
@@ -860,29 +1409,29 @@
     if (shortcut && !event.altKey && shortcutKey === "y") {
       event.preventDefault(); redo(); return;
     }
+    if (event.key === "Escape" && modalTool) {
+      event.preventDefault(); exitModalTransform(true); return;
+    }
     if ((event.target as HTMLElement | null)?.matches("input,select,textarea")) return;
     const key = event.key.toLowerCase();
-    if (key === "v") { activeTool = "move"; return; }
-    if (key === "r") { activeTool = "rotate"; return; }
-    if (key === "s") { activeTool = "scale"; return; }
+    if (key === "v") { selectEditorTool("move"); return; }
+    if (key === "g") { event.preventDefault(); enterModalTransform("move"); return; }
+    if (key === "r") { event.preventDefault(); enterModalTransform("rotate"); return; }
+    if (key === "s") { event.preventDefault(); enterModalTransform("scale"); return; }
+    if (key === "b") { selectEditorTool("shape"); return; }
+    if (activeTool === "shape" && selectedShapeNodeIndex !== null && (event.key === "Delete" || event.key === "Backspace")) {
+      event.preventDefault(); removeSelectedShapeNode(); return;
+    }
+    if (activeTool === "shape" && selectedShapeNodeIndex !== null && event.key === "Insert") {
+      event.preventDefault(); addShapeNode(); return;
+    }
     if (!event.key.startsWith("Arrow")) return;
     const amount = event.shiftKey ? 10 : 1;
     if (viewMode === "rig" && selectedBone) {
-      if (rigEditMode === "setup") {
-        const next = { ...currentSetupBoneTransform(selectedBone.id) };
-        if (event.key === "ArrowLeft") next.x -= amount;
-        if (event.key === "ArrowRight") next.x += amount;
-        if (event.key === "ArrowUp") next.y -= amount;
-        if (event.key === "ArrowDown") next.y += amount;
-        updateSetupBoneTransform(selectedBone.id, next);
-      } else if (activePose) {
-        const next = { ...currentBoneTransform(selectedBone.id) };
-        if (event.key === "ArrowLeft") next.x -= amount;
-        if (event.key === "ArrowRight") next.x += amount;
-        if (event.key === "ArrowUp") next.y -= amount;
-        if (event.key === "ArrowDown") next.y += amount;
-        updateBonePose(selectedBone.id, next);
-      }
+      if (event.key === "ArrowLeft") nudgeSelectedBone(-amount, 0);
+      if (event.key === "ArrowRight") nudgeSelectedBone(amount, 0);
+      if (event.key === "ArrowUp") nudgeSelectedBone(0, -amount);
+      if (event.key === "ArrowDown") nudgeSelectedBone(0, amount);
       event.preventDefault(); return;
     }
     if (!selectedGroupKey || !activePose) return;
@@ -893,37 +1442,76 @@
     if (event.key === "ArrowDown") transform.y += amount;
     updateTransform(selectedGroupKey, transform); event.preventDefault();
   }
-  function schedulePreview() { if (previewTimer) clearTimeout(previewTimer); previewTimer = setTimeout(() => void refreshPreview(), 90); }
-  async function canvasPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
-    const png = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("PNG encoding failed.")), "image/png"));
-    return new Uint8Array(await png.arrayBuffer());
+  function schedulePreview() {
+    previewRevision += 1;
+    if (previewTimer) clearTimeout(previewTimer);
+    // Native categorical supersampling is asynchronous, but collapsing rapid
+    // slider changes still avoids rendering intermediate states nobody sees.
+    previewTimer = setTimeout(() => {
+      previewTimer = null;
+      void refreshPreview();
+    }, aiPixelFilter ? 180 : 90);
   }
   async function refreshPreview() {
     if (!svgHost || !previewCanvas || !sourceSvg) return;
+    if (previewRunning) {
+      previewQueued = true;
+      return;
+    }
+    previewRunning = true;
     try {
-      const width = Math.max(1, Math.round(outputWidth));
-      const height = Math.max(1, Math.round(outputHeight));
-      const svg = serializeForExport(svgHost);
-      if (aiPixelFilter && isTauri()) {
-        const source = await rasterizeSvg(svg, width, height, { antiAlias, resizeMode });
-        const refined = await invoke<number[]>("refine_pixel_png", { png: Array.from(await canvasPngBytes(source)), paletteSize: Math.round(aiPaletteSize) });
+      do {
+        previewQueued = false;
+        await refreshPreviewFrame(previewRevision);
+      } while (previewQueued);
+    } finally {
+      previewRunning = false;
+      aiPreviewBusy = false;
+    }
+  }
+  async function refreshPreviewFrame(revision: number) {
+    const width = Math.max(1, Math.round(outputWidth));
+    const height = Math.max(1, Math.round(outputHeight));
+    const svg = serializeForExport(svgHost);
+    const useRasterizer = aiPixelFilter && isTauri();
+    const paletteSize = Math.round(aiPaletteSize);
+    const previewOptions = { antiAlias, resizeMode };
+    try {
+      if (useRasterizer) {
+        aiPreviewBusy = true;
+        canvasBackend = `Pixel rasterizer · resolving ${paletteSize} colors`;
+        const refined = await invoke<number[]>("render_pixel_png", {
+          svg,
+          paletteSvg: sourceSvg,
+          width,
+          height,
+          resizeMode,
+          paletteSize,
+          contourStrength: Math.round(pixelContourStrength),
+          preserveDetails: Math.round(pixelDetailFloor),
+        });
+        if (revision !== previewRevision) return;
         await renderEncodedPixelPreview(new Uint8Array(refined), previewCanvas, width, height);
-        canvasBackend = `Offline AI · ${aiPaletteSize} colors`;
+        if (revision !== previewRevision) return;
+        canvasBackend = `Pixel rasterizer · ${paletteSize} locked colors`;
+        aiPreviewBusy = false;
         return;
       }
-      const backend = await renderPixelPreview(
-        svg,
-        width,
-        height,
-        previewCanvas,
-        { antiAlias, resizeMode },
-      );
+      aiPreviewBusy = false;
+      const backend = await renderPixelPreview(svg, width, height, previewCanvas, previewOptions);
+      if (revision !== previewRevision) return;
       canvasBackend = backend === "canvaskit" ? "CanvasKit · Skia/WASM" : "Canvas 2D fallback";
-    } catch (error) { console.error(error); }
+    } catch (error) {
+      console.error(error);
+      if (revision !== previewRevision) return;
+      aiPreviewBusy = false;
+      canvasBackend = useRasterizer ? "Pixel rasterizer unavailable" : "Preview unavailable";
+      status = error instanceof Error ? error.message : String(error);
+    }
   }
   function schedulePersist() {
     if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, preferredRigEditMode, aiPixelFilter, aiPaletteSize, primaryView: viewMode, pixelVisible, playbackFps } satisfies Session)), 250);
+    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, preferredRigEditMode, aiPixelFilter, aiPaletteSize, pixelContourStrength, pixelDetailFloor, primaryView: viewMode, pixelVisible, playbackFps, zoom, canvasPan } satisfies Session)), 250);
   }
   async function exportPngInBrowser(svg: string, name: string) {
     try {
@@ -941,7 +1529,7 @@
       if (isTauri()) {
         const path = await save({ defaultPath: defaultName, filters: [{ name: "Portable Network Graphics", extensions: ["png"] }] });
         if (!path) return;
-        await invoke("export_png", { svg, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, aiFilter: aiPixelFilter, aiPaletteSize: Math.round(aiPaletteSize) });
+        await invoke("export_png", { svg, paletteSvg: sourceSvg, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, pixelArt: aiPixelFilter, paletteSize: Math.round(aiPaletteSize), contourStrength: Math.round(pixelContourStrength), preserveDetails: Math.round(pixelDetailFloor) });
         status = `Exported ${path.split(/[\\/]/).pop()}`;
       } else { await exportPngInBrowser(svg, defaultName); status = `Exported ${defaultName}`; }
     } catch (error) { status = error instanceof Error ? error.message : String(error); }
@@ -952,6 +1540,7 @@
       setWrapperMatrix(svgHost, group.key, matrices[group.key]);
       setWrapperVisibility(svgHost, group.key, groupIsVisible(group.key, pose));
     }
+    applyShapePaths(svgHost, pose?.shapePaths ?? {});
     return serializeForExport(svgHost);
   }
   function serializeAllFrames(): string[] {
@@ -983,11 +1572,11 @@
       if (isTauri()) {
         const path = await save({ defaultPath: defaultName, filters: [{ name: "Horizontal PNG Tileset", extensions: ["png"] }] });
         if (!path) return;
-        await invoke("export_tileset", { svgs, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, aiFilter: aiPixelFilter, aiPaletteSize: Math.round(aiPaletteSize) });
+        await invoke("export_tileset", { svgs, paletteSvg: sourceSvg, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, pixelArt: aiPixelFilter, paletteSize: Math.round(aiPaletteSize), contourStrength: Math.round(pixelContourStrength), preserveDetails: Math.round(pixelDetailFloor) });
         status = `Exported ${svgs.length}-frame tileset`;
       } else {
         await exportTilesetInBrowser(svgs, defaultName);
-        status = `Exported ${defaultName}${aiPixelFilter ? " without desktop AI refinement" : ""}`;
+        status = `Exported ${defaultName}${aiPixelFilter ? " without the desktop pixel-art rasterizer" : ""}`;
       }
     } catch (error) { status = error instanceof Error ? error.message : String(error); }
   }
@@ -1000,7 +1589,7 @@
   <header class="topbar">
     <div class="brand-block"><span class="brand-mark">AS</span><div><strong>ASSET/STUDIO</strong><small>VECTOR POSE LAB</small></div></div>
     <div class="document-pill" title={`${projectName} · ${fileName}`}><span class:live={Boolean(sourceSvg)} class:dirty></span><div><small>{projectPath ? `${projectName}${dirty ? " · MODIFIED" : " · SAVED"}` : `UNSAVED .ASTD${dirty ? " · MODIFIED" : " · RECOVERED"}`}</small><strong>{fileName}</strong></div></div>
-    <div class="top-actions"><div class="history-actions" aria-label="Edit history"><button disabled={!undoStack.length} onclick={undo} title="Undo (Ctrl+Z)">↶<small>CTRL Z</small></button><button disabled={!redoStack.length} onclick={redo} title="Redo (Ctrl+Y)">↷<small>CTRL Y</small></button></div><div class="file-actions" aria-label="Project files"><button onclick={openSvg} title="Import SVG"><span>↗</span><small>SVG</small></button><button onclick={openProject} title="Open .astd project (Ctrl+O)"><span>⌁</span><small>OPEN</small></button><button disabled={!sourceSvg} onclick={() => saveProject(false)} title="Save .astd project (Ctrl+S)"><span>▣</span><small>SAVE</small></button><button disabled={!sourceSvg} onclick={() => saveProject(true)} title="Save project as (Ctrl+Shift+S)"><span>＋</span><small>AS</small></button></div><button class="button primary" disabled={!sourceSvg} onclick={exportPng}><span>↓</span> Export PNG</button></div>
+    <div class="top-actions"><div class="history-actions" aria-label="Edit history"><button disabled={!undoStack.length} onclick={undo} title="Undo (Ctrl+Z)">↶<small>CTRL Z</small></button><button disabled={!redoStack.length} onclick={redo} title="Redo (Ctrl+Y)">↷<small>CTRL Y</small></button></div><div class="file-actions" aria-label="Project files"><button onclick={newProject} title="Create a new project from an SVG"><span>◇</span><small>NEW</small></button><button onclick={openSvg} title={sourceSvg ? "Replace this project's SVG and relink its rig" : "Import SVG into a new project"}><span>↗</span><small>{sourceSvg ? "SWAP" : "SVG"}</small></button><button onclick={openProject} title="Open .astd project (Ctrl+O)"><span>⌁</span><small>OPEN</small></button><button disabled={!sourceSvg} onclick={() => saveProject(false)} title="Save .astd project (Ctrl+S)"><span>▣</span><small>SAVE</small></button><button disabled={!sourceSvg} onclick={() => saveProject(true)} title="Save project as (Ctrl+Shift+S)"><span>＋</span><small>AS</small></button></div><button class="button primary" disabled={!sourceSvg} onclick={exportPng}><span>↓</span> Export PNG</button></div>
   </header>
 
   <section class="workspace">
@@ -1045,27 +1634,58 @@
       <div class="stage-toolbar">
         <div class="segmented"><button class:active={viewMode === "vector"} onclick={() => togglePrimaryView("vector")}>VECTOR</button><button class:active={viewMode === "rig"} onclick={() => togglePrimaryView("rig")}>RIG</button><button class:active={pixelVisible} onclick={togglePixelView}>PIXEL</button></div>
         <div class="stage-meta"><span>{activePose?.name ?? "REST / SOURCE"}</span><i></i><span>{pixelVisible ? `${outputWidth} × ${outputHeight} PX` : `${Math.round(zoom * 100)}%`}</span>{#if pixelVisible && viewMode}<em>SPLIT</em>{/if}</div>
-        <div class="zoom-controls"><button disabled={!viewMode} onclick={() => (zoom = Math.max(0.5, zoom - 0.1))}>−</button><span>{Math.round(zoom * 100)}%</span><button disabled={!viewMode} onclick={() => (zoom = Math.min(2, zoom + 0.1))}>+</button></div>
+        <div class="zoom-controls"><button disabled={!viewMode} title="Zoom out" onclick={() => setCanvasZoom(zoom - 0.1)}>−</button><span>{Math.round(zoom * 100)}%</span><button disabled={!viewMode} title="Zoom in" onclick={() => setCanvasZoom(zoom + 0.1)}>+</button></div>
       </div>
       <div class="tool-optionsbar">
-        <div class="active-tool-readout"><span>{viewMode === null ? "▦" : viewMode === "rig" ? "⌘" : activeTool === "move" ? "✥" : activeTool === "rotate" ? "↻" : "⌗"}</span><strong>{viewMode === null ? "PIXEL OUTPUT" : viewMode === "rig" ? "SMART BONE" : activeTool.toUpperCase()}</strong><small>{viewMode === null ? "SOLO PREVIEW" : viewMode === "rig" ? "POSITION-SENSITIVE" : activeTool === "move" ? "DRAG SELECTION" : activeTool === "rotate" ? "DRAG AROUND PIVOT" : "DRAG TO RESIZE"}</small></div>
-        {#if viewMode === "rig"}<div class="smart-gesture-legend"><span><i class="move-mark">✥</i> MIDDLE · MOVE</span><span><i class="rotate-mark">↻</i> SMALL END · ROTATE</span><span><i class="scale-mark">↔</i> END RING · RESIZE</span></div>{:else if viewMode === null}<div class="tool-hint">CLICK VECTOR OR RIG TO DOCK IT BESIDE PIXEL</div>{:else if activeTool === "scale"}<div class="transform-options"><button class:active={lockRatio} onclick={() => { lockRatio = !lockRatio; if (lockRatio) preserveArea = false; }}><span>⛓</span> LOCK RATIO</button><button class:active={preserveArea} onclick={() => { preserveArea = !preserveArea; if (preserveArea) lockRatio = false; }}><span>◫</span> KEEP AREA</button></div>{:else}<div class="tool-hint">{activeTool === "move" ? "SHIFT + ARROWS · 10 UNITS" : "PIVOT-CENTERED · NON-DESTRUCTIVE"}</div>{/if}
+        <div class:modal={Boolean(modalTool)} class="active-tool-readout"><span>{viewMode === null ? "▦" : modalTool === "move" ? "✥" : modalTool === "rotate" ? "↻" : modalTool === "scale" ? "⌗" : viewMode === "rig" ? "⌘" : activeTool === "move" ? "✥" : activeTool === "rotate" ? "↻" : activeTool === "shape" ? "◇" : "⌗"}</span><strong>{viewMode === null ? "PIXEL OUTPUT" : modalTool ? `${modalTool.toUpperCase()} LOCK` : viewMode === "rig" ? "SMART BONE" : activeTool === "shape" ? "NODE SHAPE" : activeTool.toUpperCase()}</strong><small>{viewMode === null ? "SOLO PREVIEW" : modalTool ? "DRAG ANYWHERE · ESC EXIT" : viewMode === "rig" ? "POSITION-SENSITIVE" : activeTool === "move" ? "DRAG SELECTION" : activeTool === "rotate" ? "DRAG AROUND PIVOT" : activeTool === "shape" ? "BÉZIER · POSE LOCAL" : "DRAG TO RESIZE"}</small></div>
+        {#if modalTool}<div class="modal-lock-legend"><b>SELECTION LOCKED</b><span>{viewMode === "rig" ? selectedBone?.name : selectedGroup?.label}</span><kbd>ESC</kbd></div>{:else if viewMode === "rig"}<div class="smart-gesture-legend"><span><i class="move-mark">✥</i> MIDDLE · MOVE</span><span><i class="rotate-mark">↻</i> SMALL END · ROTATE</span><span><i class="scale-mark">↔</i> END RING · RESIZE</span></div>{:else if viewMode === null}<div class="tool-hint">CLICK VECTOR OR RIG TO DOCK IT BESIDE PIXEL</div>{:else if activeTool === "shape"}
+          <div class="node-edit-actions"><button disabled={selectedShapeNodeIndex === null} title="Insert a node halfway along the next segment (Insert)" onclick={addShapeNode}><b>＋</b> NODE</button><button disabled={selectedShapeNodeIndex === null} title="Remove selected node (Delete)" onclick={removeSelectedShapeNode}><b>−</b> NODE</button><i></i><span>CONVERT</span><button class:active={selectedShapeNodeMode === "sharp"} disabled={selectedShapeNodeIndex === null} title="Corner: remove both pullers" onclick={() => setSelectedShapeNodeMode("sharp")}><b class="corner-node">⌃</b></button><button class:active={selectedShapeNodeMode === "smooth"} disabled={selectedShapeNodeIndex === null} title="Smooth: two independent pullers" onclick={() => setSelectedShapeNodeMode("smooth")}><b class="smooth-node">⌒</b></button><button class:active={selectedShapeNodeMode === "smart"} disabled={selectedShapeNodeIndex === null} title="Smart: two linked pullers" onclick={() => setSelectedShapeNodeMode("smart")}><b class="smart-node">◠</b></button></div>
+          <div class:stable={Math.abs(shapeVolumePercent - 100) <= 2} class:caution={Math.abs(shapeVolumePercent - 100) > 2 && Math.abs(shapeVolumePercent - 100) <= 10} class="shape-volume-readout"><span>VOLUME</span><strong>{shapeEditor ? `${shapeVolumePercent.toFixed(1)}%` : "—"}</strong><small>VS SOURCE</small></div>
+        {:else if activeTool === "scale"}<div class="transform-options"><button class:active={lockRatio} onclick={() => { lockRatio = !lockRatio; if (lockRatio) preserveArea = false; }}><span>⛓</span> LOCK RATIO</button><button class:active={preserveArea} onclick={() => { preserveArea = !preserveArea; if (preserveArea) lockRatio = false; }}><span>◫</span> KEEP AREA</button></div>{:else}<div class="tool-hint">{activeTool === "move" ? "SHIFT + ARROWS · 10 UNITS" : "PIVOT-CENTERED · NON-DESTRUCTIVE"}</div>{/if}
         <div class="options-spacer"></div>
         {#if viewMode === "rig"}<div class="rig-mode-switch"><span>RIG MODE</span><button class:active={rigEditMode === "setup"} onclick={() => setRigEditMode("setup")}><b>01</b> SETUP</button><button class:active={rigEditMode === "pose"} disabled={!activePose} onclick={() => setRigEditMode("pose")}><b>02</b> POSE</button></div>{/if}
       </div>
       <div class="stage" class:split-view={pixelVisible && viewMode !== null} class:pixel-only={pixelVisible && viewMode === null}>
         <div class="stage-grid"></div><div class="axis horizontal"></div><div class="axis vertical"></div>
-        <div class="viewport-pane primary-viewport" class:pane-suppressed={viewMode === null}>
+        <div bind:this={primaryViewport} class="viewport-pane primary-viewport" class:pane-suppressed={viewMode === null} class:panning={Boolean(panDrag)} class:modal-transform={Boolean(modalTool)} class:modal-move={modalTool === "move"} class:modal-rotate={modalTool === "rotate"} class:modal-scale={modalTool === "scale"} role="application" aria-label="Canvas navigation surface" onwheel={canvasWheel} onpointerdown={viewportPointerDown} onpointermove={viewportPointerMove} onpointerup={viewportPointerUp} onpointercancel={viewportPointerUp} onauxclick={(event) => event.preventDefault()}>
           <div class="pane-label"><span>{viewMode === "rig" ? "RIG" : "VECTOR"}</span><small>LIVE WORKSPACE</small></div>
+          <div class="canvas-nav-hint"><span>↕</span> SCROLL · ZOOM <i></i><span>●</span> MIDDLE DRAG · PAN <i></i><span>G R S</span> MODAL TRANSFORM {#if viewMode === "rig"}<i></i><span>⌨</span> ARROWS · 1 PX{/if}</div>
           <nav class="tool-rail" aria-label="Transform tools">
-            {#if viewMode === "rig"}<button class="active smart-tool" title="Smart bone transform"><span>⌘</span><small>AUTO</small></button>{:else}<button class:active={activeTool === "move"} onclick={() => (activeTool = "move")} title="Move tool (V)"><span>✥</span><small>V</small></button>
-            <button class:active={activeTool === "rotate"} onclick={() => (activeTool = "rotate")} title="Rotate tool (R)"><span>↻</span><small>R</small></button>
-            <button class:active={activeTool === "scale"} onclick={() => (activeTool = "scale")} title="Resize tool (S)"><span>⌗</span><small>S</small></button>{/if}
+            {#if viewMode === "rig"}<button class:active={!modalTool} class="smart-tool" title="Position-sensitive bone transform"><span>⌘</span><small>AUTO</small></button><button class:active={modalTool === "move"} onclick={() => enterModalTransform("move")} title="Lock selected bone to move mode (G)"><span>✥</span><small>G</small></button><button class:active={modalTool === "rotate"} onclick={() => enterModalTransform("rotate")} title="Lock selected bone to rotate mode (R)"><span>↻</span><small>R</small></button><button class:active={modalTool === "scale"} onclick={() => enterModalTransform("scale")} title="Lock selected bone to scale mode (S)"><span>⌗</span><small>S</small></button>{:else}<button class:active={activeTool === "move"} onclick={() => selectEditorTool("move")} title="Move tool (G for modal lock, V for persistent)"><span>✥</span><small>G</small></button>
+            <button class:active={activeTool === "rotate"} onclick={() => selectEditorTool("rotate")} title="Rotate tool (R)"><span>↻</span><small>R</small></button>
+            <button class:active={activeTool === "scale"} onclick={() => selectEditorTool("scale")} title="Resize tool (S)"><span>⌗</span><small>S</small></button>
+            <button class:active={activeTool === "shape"} onclick={() => selectEditorTool("shape")} title="Non-destructive node shape tool (B)"><span>◇</span><small>B</small></button>{/if}
             <i></i><div class="tool-rail-mode">{viewMode === "rig" ? (rigEditMode === "setup" ? "SET" : "POSE") : "SVG"}</div>
           </nav>
-          <div class={`artboard-wrap tool-${activeTool}`} style={`--zoom:${zoom};--art-ratio:${viewBox[2] / viewBox[3]}`} class:rig-mode={viewMode === "rig"}>
+          {#if modalTool}<div class={`modal-tool-banner ${modalTool}`}><kbd>{modalTool === "move" ? "G" : modalTool === "rotate" ? "R" : "S"}</kbd><strong>{modalTool.toUpperCase()}</strong><span>{viewMode === "rig" ? selectedBone?.name : selectedGroup?.label}</span><small>DRAG SCENE · ESC TO EXIT</small></div>{/if}
+          <div class={`artboard-wrap tool-${activeTool}`} style={`--zoom:${zoom};--pan-x:${canvasPan.x}px;--pan-y:${canvasPan.y}px;--art-ratio:${viewBox[2] / viewBox[3]}`} class:rig-mode={viewMode === "rig"} class:modal-transform={Boolean(modalTool)} class:modal-move={modalTool === "move"} class:modal-rotate={modalTool === "rotate"} class:modal-scale={modalTool === "scale"}>
             <div class="artboard-shadow"></div>
             <div bind:this={svgHost} class="svg-host" role="application" aria-label="SVG pose viewport" onpointerdown={pointerDown} onpointermove={pointerMove} onpointerup={pointerUp} onpointercancel={pointerUp}></div>
+            {#if viewMode}
+              <svg bind:this={vectorOverlay} class:node-editing={viewMode === "vector" && activeTool === "shape"} class="selection-overlay" viewBox={viewBox.join(" ")} preserveAspectRatio="xMidYMid meet" shape-rendering="geometricPrecision" role="application" aria-label="Vector selection geometry" onpointerdown={shapePointerDown} onpointermove={shapePointerMove} onpointerup={shapePointerUp} onpointercancel={shapePointerUp}>
+                {#if selectionOverlay}
+                  <g transform={selectionOverlay.matrix} class:bone-bound-overlay={selectionOverlay.kind === "bone"} class="selection-bounds">
+                    <rect class="selection-bounds-wash" x={selectionOverlay.x} y={selectionOverlay.y} width={selectionOverlay.width} height={selectionOverlay.height}></rect>
+                    <rect class="selection-bounds-line" x={selectionOverlay.x} y={selectionOverlay.y} width={selectionOverlay.width} height={selectionOverlay.height}></rect>
+                    {#if selectionOverlay.kind === "selection"}
+                      {#each [[selectionOverlay.x, selectionOverlay.y], [selectionOverlay.x + selectionOverlay.width, selectionOverlay.y], [selectionOverlay.x + selectionOverlay.width, selectionOverlay.y + selectionOverlay.height], [selectionOverlay.x, selectionOverlay.y + selectionOverlay.height]] as corner}
+                        <rect class="selection-corner" x={corner[0]} y={corner[1]} width="7" height="7" transform={`translate(-3.5 -3.5)`}></rect>
+                      {/each}
+                    {/if}
+                  </g>
+                {/if}
+                {#if viewMode === "vector" && activeTool === "shape" && shapeEditor}
+                  {@const editor = shapeEditor}
+                  <g transform={editor.matrix} class="node-shape">
+                    <path class="node-shape-outline" d={editor.d}></path>
+                    {#each editor.guides.filter((guide) => selectedShapeNodeMode !== "sharp" && guide.nodeIndex === selectedShapeNodeIndex) as guide}<line class="node-guide" x1={guide.x1} y1={guide.y1} x2={guide.x2} y2={guide.y2}></line>{/each}
+                    {#each editor.handles.filter((handle) => handle.kind === "anchor" || (selectedShapeNodeMode !== "sharp" && nodeIndexForHandle(editor.commands, handle) === selectedShapeNodeIndex)) as handle}
+                      {#if handle.kind === "control"}<circle class="node-handle control" data-shape-handle={handle.id} cx={handle.x} cy={handle.y} r="3.5"></circle>{:else}<rect class:selected={handle.commandIndex === selectedShapeNodeIndex} class="node-handle anchor" data-shape-handle={handle.id} x={handle.x - 4} y={handle.y - 4} width="8" height="8"></rect>{/if}
+                    {/each}
+                  </g>
+                {/if}
+              </svg>
+            {/if}
             {#if viewMode === "rig"}
               <svg bind:this={rigSvg} class="rig-overlay" viewBox={viewBox.join(" ")} preserveAspectRatio="xMidYMid meet" role="application" aria-label="Bone rig overlay" onpointerdown={boneOverlayPointerDown} onpointermove={bonePointerMove} onpointerup={bonePointerUp} onpointercancel={bonePointerUp}>
                 {#each renderedBones as bone}
@@ -1092,8 +1712,8 @@
           </div>
         </div>
         <div class="viewport-pane pixel-viewport" class:pane-suppressed={!pixelVisible}>
-          <div class="pane-label pixel-label"><span>PIXEL</span><small>{aiPixelFilter ? `LOCAL AI · ${aiPaletteSize}C` : "EXACT PREVIEW"}</small></div>
-          <div class="pixel-preview" style={`aspect-ratio:${outputWidth}/${outputHeight}`}><canvas bind:this={previewCanvas} aria-label="Pixel-art preview"></canvas><div class="pixel-badge">{aiPixelFilter ? `AI ${aiPaletteSize}C` : antiAlias === 0 ? "HARD ALPHA" : `EDGE AA ${antiAlias}%`} · {resizeMode === "contain" ? "FIT CENTER" : "STRETCH"}</div></div>
+          <div class="pane-label pixel-label"><span>PIXEL</span><small>{aiPreviewBusy ? "RASTERIZER · RESOLVING…" : aiPixelFilter ? `LOCKED · ${aiPaletteSize}C` : "EXACT PREVIEW"}</small></div>
+          <div class="pixel-preview" style={`aspect-ratio:${outputWidth}/${outputHeight}`}><canvas bind:this={previewCanvas} aria-label="Pixel-art preview"></canvas><div class:processing={aiPreviewBusy} class="pixel-badge">{aiPreviewBusy ? "RESOLVING PIXELS…" : aiPixelFilter ? `CATEGORICAL ${aiPaletteSize}C` : antiAlias === 0 ? "HARD ALPHA" : `EDGE AA ${antiAlias}%`} · {resizeMode === "contain" ? "FIT CENTER" : "STRETCH"}</div></div>
         </div>
         {#if !sourceSvg}<button class="drop-target" onclick={openSvg}><span class="drop-icon">＋</span><strong>LOAD YOUR VECTOR</strong><p>SVG groups become poseable layers.</p><small>OPEN .SVG</small></button>{/if}
       </div>
@@ -1122,6 +1742,21 @@
       {:else if selectedGroup}
         <div class="selection-card"><span class="selection-chip">G</span><div><small>ACTIVE GROUP</small><strong>{selectedGroup.label}</strong></div></div>
         {#if !activePose}<div class="lock-notice"><span>▣</span><div><strong>Rest pose is locked</strong><small>Create a pose to transform this group.</small></div></div>{/if}
+        {#if activeTool === "shape"}
+          <div class="shape-inspector" class:empty={!shapeEditor}>
+            <div class="section-label"><span>VECTOR VOLUME</span><small>VS IMMUTABLE SOURCE</small></div>
+            {#if shapeEditor}
+              <div class:stable={Math.abs(shapeVolumePercent - 100) <= 2} class:caution={Math.abs(shapeVolumePercent - 100) > 2 && Math.abs(shapeVolumePercent - 100) <= 10} class="volume-score"><strong>{shapeVolumePercent.toFixed(1)}%</strong><span>{shapeVolumePercent < 99.95 ? "SMALLER" : shapeVolumePercent > 100.05 ? "LARGER" : "EXACT"}</span></div>
+              <div class="volume-track"><i style={`width:${Math.min(100, shapeVolumePercent)}%`}></i><b style="left:100%"></b></div>
+              <div class="volume-scale"><span>0%</span><span>SOURCE · 100%</span></div>
+              {#if selectedShapeNodeIndex !== null}<div class={`node-mode-summary mode-${selectedShapeNodeMode}`}><span>NODE {String(selectedShapeNodeIndex + 1).padStart(2, "0")}</span><strong>{selectedShapeNodeMode === "sharp" ? "CORNER" : selectedShapeNodeMode.toUpperCase()}</strong><small>{selectedShapeNodeMode === "sharp" ? "NO PULLERS · SQUARE / CUSP" : selectedShapeNodeMode === "smooth" ? "TWO INDEPENDENT PULLERS" : "TWO LINKED PULLERS"}</small></div>{:else}<div class="node-mode-summary empty"><span>SELECT AN ANCHOR</span><small>PULLERS APPEAR ONLY FOR THAT NODE</small></div>{/if}
+              <p>Area is measured from this pose's edited path. Moving Bézier nodes never changes the source SVG or another pose.</p>
+              <button class="shape-reset" disabled={!activePose || !activePose.shapePaths?.[shapeEditor.shapeKey]} onclick={resetSelectedShape}>RESTORE THIS SHAPE TO 100%</button>
+            {:else}
+              <p>Select a supported path, rectangle, circle, ellipse, line, or polygon on the canvas.</p>
+            {/if}
+          </div>
+        {/if}
         {@const transform = currentTransform(selectedGroup.key)}
         <div class="control-section" class:disabled={!activePose}><div class="section-label"><span>POSITION</span><small>SVG UNITS</small></div><div class="control-grid"><label><span>X</span><input disabled={!activePose} type="number" step="1" value={transform.x.toFixed(2)} oninput={(event) => changeTransform("x", event)} /></label><label><span>Y</span><input disabled={!activePose} type="number" step="1" value={transform.y.toFixed(2)} oninput={(event) => changeTransform("y", event)} /></label></div></div>
         <div class="control-section" class:disabled={!activePose}><div class="section-label"><span>ROTATION</span><small>DEGREES</small></div><label class="wide-control"><span>R</span><input disabled={!activePose} type="number" step="1" value={transform.rotation.toFixed(2)} oninput={(event) => changeTransform("rotation", event)} /></label></div>
@@ -1130,13 +1765,16 @@
       <div class="export-panel">
         <div class="section-label"><span>PIXEL OUTPUT</span><small>PNG</small></div>
         <div class="resolution-control"><label><span>W</span><input type="number" min="1" max="16384" bind:value={outputWidth} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></label><span class="times">×</span><label><span>H</span><input type="number" min="1" max="16384" bind:value={outputHeight} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></label></div>
-        <div class="pixel-option"><div class="option-copy"><span>EDGE ANTIALIAS</span><strong>{antiAlias === 0 ? "0 · BINARY ALPHA" : `${antiAlias}%`}</strong></div><input aria-label="Edge antialias" type="range" min="0" max="100" step="1" bind:value={antiAlias} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
+        <div class:disabled={aiPixelFilter} class="pixel-option"><div class="option-copy"><span>EDGE ANTIALIAS</span><strong>{aiPixelFilter ? "OVERRIDDEN · HARD" : antiAlias === 0 ? "0 · BINARY ALPHA" : `${antiAlias}%`}</strong></div><input aria-label="Edge antialias" disabled={aiPixelFilter} type="range" min="0" max="100" step="1" bind:value={antiAlias} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
         <label class="select-control pixel-fit"><span>↔</span><select bind:value={resizeMode} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }}><option value="contain">FIT RATIO · CENTERED</option><option value="stretch">STRETCH TO OUTPUT</option></select></label>
-        <p class="option-note">At 0, every visible edge pixel is fully opaque and every empty pixel is fully transparent—no partial alpha.</p>
-        <div class:active={aiPixelFilter} class="ai-filter-card">
-          <label class="ai-toggle"><input type="checkbox" bind:checked={aiPixelFilter} disabled={!desktopRuntime} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }} /><span class="toggle-track"><i></i></span><span><strong>OFFLINE PIXEL AI</strong><small>{desktopRuntime ? "LOCAL · NO NETWORK" : "DESKTOP APP ONLY"}</small></span></label>
-          <div class="ai-palette" class:disabled={!aiPixelFilter}><div class="option-copy"><span>LEARNED PALETTE</span><strong>{aiPaletteSize} COLORS</strong></div><input aria-label="AI palette colors" disabled={!aiPixelFilter} type="range" min="2" max="64" step="1" bind:value={aiPaletteSize} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
-          <p>The local NumPy model learns the asset's palette, hardens alpha, and removes isolated color noise. No files leave this computer.</p>
+        <p class="option-note">The rasterizer always outputs absolute opaque or transparent pixels and never blends neighboring SVG groups.</p>
+        <div class:active={aiPixelFilter} class:processing={aiPreviewBusy} class="ai-filter-card">
+          <label class="ai-toggle"><input type="checkbox" bind:checked={aiPixelFilter} disabled={!desktopRuntime} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }} /><span class="toggle-track"><i></i></span><span><strong>PIXEL ART RASTERIZER</strong><small>{aiPreviewBusy ? "RESOLVING · EDITOR STAYS LIVE" : desktopRuntime ? "RUST · DETERMINISTIC" : "DESKTOP APP ONLY"}</small></span></label>
+          <div class="rasterizer-method"><span>ADAPTIVE SS</span><i></i><span>NO BLEND</span><i></i><span>POSE LOCK</span></div>
+          <div class="ai-palette" class:disabled={!aiPixelFilter}><div class="option-copy"><span>LOCKED SVG PALETTE</span><strong>{aiPaletteSize} COLORS</strong></div><input aria-label="Locked SVG palette colors" disabled={!aiPixelFilter} type="range" min="2" max="64" step="1" bind:value={aiPaletteSize} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
+          <div class="ai-palette" class:disabled={!aiPixelFilter}><div class="option-copy"><span>CONTOUR CLEANUP</span><strong>{pixelContourStrength < 25 ? "OFF" : pixelContourStrength < 75 ? "DOUBLES" : "STRICT"}</strong></div><input aria-label="Contour cleanup" disabled={!aiPixelFilter} type="range" min="0" max="100" step="1" bind:value={pixelContourStrength} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
+          <label class="select-control raster-detail" class:disabled={!aiPixelFilter}><span>▪</span><select aria-label="Minimum pixel cluster" disabled={!aiPixelFilter} bind:value={pixelDetailFloor} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }}><option value={1}>KEEP 1 PX DETAILS</option><option value={2}>REMOVE 1 PX NOISE</option><option value={3}>MINIMUM 3 PX CLUSTER</option><option value={4}>MINIMUM 4 PX CLUSTER</option></select></label>
+          <p>Each output pixel chooses one original SVG color. Contours remove doubles and L-corners; every pose shares the same palette and grid.</p>
         </div>
         <button class="export-wide" disabled={!sourceSvg} onclick={exportPng}>EXPORT ACTIVE POSE <span>↓</span></button>
         <button class="export-wide secondary" disabled={!sourceSvg || poses.length === 0} onclick={exportTileset}>EXPORT {poses.length} POSE{poses.length === 1 ? "" : "S"} <span>▦</span></button>
