@@ -4,13 +4,13 @@
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
   import initStudioCore, { transform_matrix } from "$lib/wasm/studio_core.js";
-  import { composeBoneTransform, createPose, identityBoneTransform, identityTransform, relativeBoneTransform, type Bone, type BonePoseTransform, type GroupTransform, type NodeMode, type PixelResizeMode, type Pose, type SvgGroup } from "$lib/editor/model";
+  import { composeBoneTransform, createPose, identityBoneTransform, identityTransform, relativeBoneTransform, type Bone, type BonePoseTransform, type GroupTransform, type NodeMode, type PixelResizeMode, type Pose, type SvgGroup, type SvgShape } from "$lib/editor/model";
   import { applyShapePath, applyShapePaths, highlightBoneWrapper, prepareSvg, selectWrapper, serializeForExport, setWrapperMatrix, setWrapperVisibility, shapeElementToPathData } from "$lib/editor/svg";
   import { encodedPngToCanvas, loadCanvasKit, overlayOnionSkins, rasterizeSvg, renderEncodedPixelPreview, renderPixelPreview } from "$lib/editor/pixel-preview";
-  import { boneDepth, boneGroupMatrices, boneTransformFromLocalMatrix, boneWorldMap, childBoneTargetGroup, childWorldMatrixWithoutInheritedScale, composeGroupLocalMatrices, dominantSampleOwner, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, orientBoneStartToward, translateBoneEndpoints, wouldCreateCycle, type Matrix, type RigGroupTarget } from "$lib/editor/rig";
+  import { boneDepth, boneGroupMatrices, boneTransformFromLocalMatrix, boneWorldMap, childBoneTargetGroup, childWorldMatrixWithoutInheritedScale, composeGroupLocalMatrices, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, orientBoneStartToward, translateBoneEndpoints, wouldCreateCycle, type Matrix, type RigGroupTarget } from "$lib/editor/rig";
   import { appendHistory, cloneSerializable, snapshotsEqual, type HistoryEntry } from "$lib/editor/history";
   import { decodeAstdProject, encodeAstdProject, type AstdProjectState } from "$lib/editor/project";
-  import { remapGroupRecord, replacementGroupMap } from "$lib/editor/relink";
+  import { remapGroupRecord, remapShapeRecord, replacementGroupMap, replacementShapeMap } from "$lib/editor/relink";
   import { clampCanvasZoom, outputPixelDelta, zoomPanAroundAnchor } from "$lib/editor/viewport";
   import { addPathNodeAfter, configurePathNode, deformPathWithBones, movePathHandle, nodeIndexForHandle, parsePathData, pathArea, pathControlGuides, pathHandles, removePathNode, serializePathData, type ControlGuide, type PathBoneInfluence, type PathCommand, type PathHandle } from "$lib/editor/shape";
   import { steppedPoseId, wrappedPoseNeighbors } from "$lib/editor/animation";
@@ -24,9 +24,8 @@
   type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; preferredRigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; pixelContourStrength?: number; pixelDetailFloor?: number; pixelCoverageThreshold?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; onionSkin?: boolean; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number; zoom?: number; canvasPan?: { x: number; y: number } };
   type DocumentSnapshot = { poses: Pose[]; bones: Bone[]; setupBoneTransforms: Record<string, BonePoseTransform>; activePoseId: string; selectedGroupKey: string | null; selectedBoneId: string | null };
   type DragState = { pointerId: number; key: string; startPoint: { x: number; y: number }; startTransform: GroupTransform; inverse: DOMMatrix; rootToTool: Matrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number; historyBefore: DocumentSnapshot };
-  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; didMove: boolean; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startMatrix: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; startChildMatrices: Record<string, Matrix>; historyBefore: DocumentSnapshot };
+  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startMatrix: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; startChildMatrices: Record<string, Matrix>; historyBefore: DocumentSnapshot };
   type PanDragState = { pointerId: number; startClient: { x: number; y: number }; startPan: { x: number; y: number } };
-  type GroupHitArea = { key: string; depth: number; area: number; box: { x: number; y: number; width: number; height: number }; rootToLocal: Matrix };
   type SelectionOverlay = { key: string; x: number; y: number; width: number; height: number; matrix: string; kind: "selection" | "bone" };
   type ShapeEditor = { shapeKey: string; groupKey: string; d: string; sourceD: string; commands: PathCommand[]; handles: PathHandle[]; guides: ControlGuide[]; matrix: string; rootToLocal: Matrix; sourceArea: number; currentArea: number };
   type ShapeDragState = { pointerId: number; handle: PathHandle; nodeMode: NodeMode; historyBefore: DocumentSnapshot };
@@ -48,6 +47,7 @@
   let sourceSvg = $state("");
   let fileName = $state("No source loaded");
   let groups = $state<SvgGroup[]>([]);
+  let shapes = $state<SvgShape[]>([]);
   let poses = $state<Pose[]>([]);
   let bones = $state<Bone[]>([]);
   let setupBoneTransforms = $state<Record<string, BonePoseTransform>>({});
@@ -100,6 +100,9 @@
   let previewRunning = false;
   let previewQueued = false;
   let previewRevision = 0;
+  let pixelPrerenderGeneration = 0;
+  const pixelFrameCache = new Map<string, Uint8Array>();
+  let pixelPrerenderPromise: Promise<void> | null = null;
   let aiPreviewBusy = $state(false);
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   let overlayFrame: number | null = null;
@@ -200,7 +203,7 @@
       viewMode = session.primaryView === "rig" || session.primaryView === null ? session.primaryView : "vector";
       pixelVisible = session.pixelVisible === true;
       if (!viewMode && !pixelVisible) viewMode = "vector";
-      playbackFps = [1, 2, 4, 8].includes(session.playbackFps || 0) ? session.playbackFps! : 2;
+      playbackFps = [1, 2, 4, 8, 12].includes(session.playbackFps || 0) ? session.playbackFps! : 2;
       onionSkin = session.onionSkin === true;
       zoom = Math.max(0.25, Math.min(4, session.zoom ?? 1));
       canvasPan = Number.isFinite(session.canvasPan?.x) && Number.isFinite(session.canvasPan?.y)
@@ -214,6 +217,7 @@
 
   onDestroy(() => {
     previewRevision += 1;
+    clearPixelPrerenderCache();
     if (previewTimer) clearTimeout(previewTimer);
     if (persistTimer) clearTimeout(persistTimer);
     if (playbackTimer) clearTimeout(playbackTimer);
@@ -422,7 +426,7 @@
     selectWrapper(svgHost, selectedGroupKey);
     highlightBoneWrapper(svgHost, selectedBone?.groupKey ?? null);
     scheduleEditorOverlay();
-    schedulePreview();
+    schedulePreview(isPlaying);
   }
   function setRigEditMode(mode: RigEditMode) {
     if (mode === "pose" && !activePose) { status = "Create a pose before entering Pose mode."; return; }
@@ -560,7 +564,7 @@
   }
   async function loadSvgSource(svg: string, name: string, persist = true) {
     const prepared = prepareSvg(svg);
-    sourceSvg = svg; fileName = name; groups = prepared.groups; warnings = prepared.warnings; viewBox = prepared.viewBox;
+    sourceSvg = svg; fileName = name; groups = prepared.groups; shapes = prepared.shapes; warnings = prepared.warnings; viewBox = prepared.viewBox;
     selectedGroupKey = groups[0]?.key ?? null; selectedBoneId = null; selectedShapeKey = null; selectedShapeNodeIndex = null; poses = []; bones = []; setupBoneTransforms = {}; activePoseId = "rest"; undoStack = []; redoStack = []; projectPath = null; zoom = 1; canvasPan = { x: 0, y: 0 };
     svgHost.innerHTML = prepared.markup;
     requestAnimationFrame(() => { collectPivots(); applyAllTransforms(); });
@@ -571,13 +575,21 @@
   async function replaceSvgSource(svg: string, name: string) {
     const prepared = prepareSvg(svg);
     const mapping = replacementGroupMap(groups, prepared.groups);
+    const shapeMapping = replacementShapeMap(shapes, prepared.shapes, mapping);
     const mappedBindings = bones.filter((bone) => bone.groupKey && mapping[bone.groupKey]).length;
     const previousBindingCount = bones.filter((bone) => bone.groupKey).length;
     const previousSelection = selectedGroupKey;
+    const previousShapeSelection = selectedShapeKey;
+    const overriddenShapeKeys = new Set(poses.flatMap((pose) => [
+      ...Object.keys(pose.shapePaths ?? {}),
+      ...Object.keys(pose.shapeNodeModes ?? {}),
+    ]));
+    const mappedShapeOverrides = Array.from(overriddenShapeKeys).filter((key) => shapeMapping[key]).length;
 
     sourceSvg = svg;
     fileName = name;
     groups = prepared.groups;
+    shapes = prepared.shapes;
     warnings = prepared.warnings;
     viewBox = prepared.viewBox;
     bones = bones.map((bone) => ({
@@ -588,9 +600,11 @@
       ...pose,
       transforms: remapGroupRecord(pose.transforms, mapping),
       visibility: remapGroupRecord(pose.visibility, mapping),
+      shapePaths: remapShapeRecord(pose.shapePaths, shapeMapping),
+      shapeNodeModes: remapShapeRecord(pose.shapeNodeModes, shapeMapping),
     }));
     selectedGroupKey = previousSelection ? mapping[previousSelection] ?? prepared.groups[0]?.key ?? null : prepared.groups[0]?.key ?? null;
-    selectedShapeKey = null;
+    selectedShapeKey = previousShapeSelection ? shapeMapping[previousShapeSelection] ?? null : null;
     selectedShapeNodeIndex = null;
     undoStack = [];
     redoStack = [];
@@ -609,7 +623,11 @@
     schedulePersist();
     schedulePreview();
     const lost = previousBindingCount - mappedBindings;
-    status = `SVG replaced · ${mappedBindings}/${previousBindingCount} rig binding${previousBindingCount === 1 ? "" : "s"} relinked${lost ? ` · ${lost} needs review` : ""}`;
+    const droppedShapeOverrides = overriddenShapeKeys.size - mappedShapeOverrides;
+    const curveStatus = overriddenShapeKeys.size
+      ? ` · ${mappedShapeOverrides}/${overriddenShapeKeys.size} edited curve${overriddenShapeKeys.size === 1 ? "" : "s"} relinked${droppedShapeOverrides ? ` · ${droppedShapeOverrides} stale curve override${droppedShapeOverrides === 1 ? "" : "s"} removed` : ""}`
+      : "";
+    status = `SVG replaced · ${mappedBindings}/${previousBindingCount} rig binding${previousBindingCount === 1 ? "" : "s"} relinked${curveStatus}${lost ? ` · ${lost} rig needs review` : ""}`;
   }
   async function chooseSvg(mode: "new" | "replace") {
     try {
@@ -793,6 +811,7 @@
   }
   function stopPlayback() {
     isPlaying = false;
+    clearPixelPrerenderCache();
     if (playbackTimer) clearTimeout(playbackTimer);
     playbackTimer = null;
     if (viewMode === "rig" && rigEditMode === "setup") setupFrozenMatrices = calculatedGroupMatrices();
@@ -806,15 +825,20 @@
     choosePose(frames[(current + 1) % frames.length], true);
     playbackTimer = setTimeout(playbackStep, 1000 / playbackFps);
   }
-  function togglePlayback() {
+  async function togglePlayback() {
     if (isPlaying) { stopPlayback(); status = "Pose playback stopped"; return; }
     if (!sourceSvg || poses.length === 0) { status = "Create at least one pose to play the animation."; return; }
+    clearPixelPrerenderCache();
     activePoseId = poses[0].id;
     rigEditMode = preferredRigEditMode;
     isPlaying = true;
     applyAllTransforms();
+    const generation = pixelPrerenderGeneration;
+    status = `Preparing ${poses.length} pixel frame${poses.length === 1 ? "" : "s"} before playback…`;
+    await prerenderPixelFrames();
+    if (!isPlaying || generation !== pixelPrerenderGeneration) return;
     playbackTimer = setTimeout(playbackStep, 1000 / playbackFps);
-    status = `Playing ${poses.length} pose${poses.length === 1 ? "" : "s"} at ${playbackFps} FPS`;
+    status = `Playing ${poses.length} pose${poses.length === 1 ? "" : "s"} at ${playbackFps} FPS · pixel cache ready`;
   }
   function toggleOnionSkin() {
     onionSkin = !onionSkin;
@@ -1080,81 +1104,6 @@
     } catch {
       return null;
     }
-  }
-  function currentGroupHitAreas(): GroupHitArea[] {
-    const root = svgHost.querySelector("svg");
-    const rootInverse = root?.getCTM()?.inverse();
-    if (!rootInverse) return [];
-    return groups.flatMap((group) => {
-      if (!groupIsVisible(group.key)) return [];
-      const wrapper = svgHost.querySelector(`[data-studio-group="${CSS.escape(group.key)}"]`) as SVGGElement | null;
-      const wrapperCtm = wrapper?.getCTM();
-      if (!wrapper || !wrapperCtm) return [];
-      try {
-        const box = wrapper.getBBox();
-        if (box.width <= 0 || box.height <= 0) return [];
-        const relative = rootInverse.multiply(wrapperCtm);
-        const localToRoot: Matrix = [relative.a, relative.b, relative.c, relative.d, relative.e, relative.f];
-        const determinant = Math.abs(localToRoot[0] * localToRoot[3] - localToRoot[1] * localToRoot[2]);
-        return [{
-          key: group.key,
-          depth: group.depth,
-          area: box.width * box.height * Math.max(1e-6, determinant),
-          box: { x: box.x, y: box.y, width: box.width, height: box.height },
-          rootToLocal: invertMatrix(localToRoot),
-        }];
-      } catch {
-        return [];
-      }
-    }).sort((left, right) => right.depth - left.depth || left.area - right.area);
-  }
-  function groupAtBoneSample(point: { x: number; y: number }, areas: GroupHitArea[]): string | null {
-    for (const area of areas) {
-      const local = pointWithMatrix(area.rootToLocal, point.x, point.y);
-      if (local.x >= area.box.x && local.x <= area.box.x + area.box.width
-        && local.y >= area.box.y && local.y <= area.box.y + area.box.height) return area.key;
-    }
-    return null;
-  }
-  function dominantGroupForBone(world: { startX: number; startY: number; endX: number; endY: number }): { key: string; coverage: number } | null {
-    const sampleCount = 25;
-    const areas = currentGroupHitAreas();
-    const owners = Array.from({ length: sampleCount }, (_, index) => {
-      const amount = index / (sampleCount - 1);
-      return groupAtBoneSample({
-        x: world.startX + (world.endX - world.startX) * amount,
-        y: world.startY + (world.endY - world.startY) * amount,
-      }, areas);
-    });
-    return dominantSampleOwner(owners, 0.6);
-  }
-  function autoBindMovedBone(boneId: string): { label: string; fitted: boolean; multi: boolean } | null {
-    if (rigEditMode !== "setup") return null;
-    const bone = bones.find((item) => item.id === boneId);
-    const world = boneWorlds[boneId];
-    if (!bone || !world) return null;
-    const overlap = dominantGroupForBone(world);
-    if (!overlap || overlap.key === bone.groupKey) return null;
-    const groupAlreadyRigged = bones.some((item) => item.id !== boneId && item.groupKey === overlap.key);
-    const fitted = groupAlreadyRigged ? null : fittedBoneForGroup({ ...bone, groupKey: overlap.key }, overlap.key);
-    // Binding is authoritative and must not depend on getBBox/fit support.
-    // Some valid SVG groups can be hit-tested but cannot produce a stable box
-    // in the current rendered pose. In that case keep the moved geometry and
-    // still persist the group relationship.
-    const groupLabel = groups.find((group) => group.key === overlap.key)?.label ?? bone.name;
-    const boundBone: Bone = { ...(fitted?.bone ?? bone), groupKey: overlap.key, name: groupLabel };
-    bones = bones.map((item) => item.id === boneId ? boundBone : item);
-    if (fitted) setupBoneTransforms = { ...setupBoneTransforms, [boneId]: fitted.setup };
-    selectedBoneId = boneId;
-    selectedGroupKey = overlap.key;
-    dirty = true;
-    applyAllTransforms();
-    schedulePersist();
-    return {
-      label: groupLabel,
-      fitted: Boolean(fitted),
-      multi: groupAlreadyRigged,
-    };
   }
   function fitSelectedBoneToGroup() {
     if (!selectedBone?.groupKey || rigEditMode !== "setup") return;
@@ -1462,7 +1411,6 @@
       gesture,
       inverse,
       startPoint,
-      didMove: false,
       startBone: { ...bone },
       startSetup: { ...currentSetupBoneTransform(boneId) },
       startPose: { ...currentBoneTransform(boneId) },
@@ -1494,7 +1442,6 @@
     const bone = bones.find((item) => item.id === boneDrag?.boneId);
     if (!bone) return;
     const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(boneDrag.inverse);
-    if (Math.hypot(point.x - boneDrag.startPoint.x, point.y - boneDrag.startPoint.y) >= 0.5) boneDrag.didMove = true;
     const start = boneDrag.startWorld;
     const dx = start.endX - start.startX;
     const dy = start.endY - start.startY;
@@ -1528,17 +1475,10 @@
     if (!boneDrag || boneDrag.pointerId !== event.pointerId) return;
     const completed = boneDrag;
     const before = completed.historyBefore;
-    const autoBinding = completed.gesture === "move" && completed.didMove ? autoBindMovedBone(completed.boneId) : null;
     boneDrag = null;
-    commitHistory(autoBinding ? autoBinding.fitted ? "Move, bind, and fit bone" : "Move and bind bone" : "Transform bone", before);
+    commitHistory("Transform bone", before);
     schedulePreview();
-    status = autoBinding
-      ? autoBinding.fitted
-        ? `Auto-bound and fitted to ${autoBinding.label}`
-        : autoBinding.multi
-          ? `Auto-bound to ${autoBinding.label} · multi-bone Pose deformation enabled`
-          : `Auto-bound to ${autoBinding.label} · fit unavailable, moved placement kept`
-      : rigEditMode === "setup" ? "Guide placement updated; artwork remains frozen" : `${activePose?.name ?? "Pose"} rig transform updated`;
+    status = rigEditMode === "setup" ? "Guide placement updated; binding preserved" : `${activePose?.name ?? "Pose"} rig transform updated`;
   }
   function pointerDown(event: PointerEvent) {
     if (event.button !== 0) return;
@@ -1733,15 +1673,61 @@
       event.preventDefault(); stepPoseView(event.key === "ArrowLeft" ? -1 : 1);
     }
   }
-  function schedulePreview() {
+  function clearPixelPrerenderCache() {
+    pixelPrerenderGeneration += 1;
+    pixelFrameCache.clear();
+    pixelPrerenderPromise = null;
+  }
+  async function encodePreviewCanvas(canvas: HTMLCanvasElement): Promise<Uint8Array> {
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((value) => value ? resolve(value) : reject(new Error("Pixel frame encoding failed.")), "image/png");
+    });
+    return new Uint8Array(await blob.arrayBuffer());
+  }
+  async function renderPlaybackPixelFrame(svg: string, width: number, height: number): Promise<Uint8Array> {
+    if (aiPixelFilter && isTauri()) return renderRefinedPixelPng(svg, width, height);
+    return encodePreviewCanvas(await rasterizeSvg(svg, width, height, { antiAlias, resizeMode }));
+  }
+  async function prerenderPixelFrames() {
+    if (pixelPrerenderPromise || !isPlaying || poses.length === 0) return;
+    const generation = pixelPrerenderGeneration;
+    const width = Math.max(1, Math.round(outputWidth));
+    const height = Math.max(1, Math.round(outputHeight));
+    // Serialize all frames before awaiting raster work. This keeps playback
+    // from racing with temporary SVG host transforms during the first loop.
+    const frameSvgs = poses.map((pose) => ({ id: pose.id, svg: serializePoseFrame(pose) }));
+    restoreActivePoseHost();
+    pixelPrerenderPromise = (async () => {
+      for (const frame of frameSvgs) {
+        if (!isPlaying || generation !== pixelPrerenderGeneration) return;
+        const png = await renderPlaybackPixelFrame(frame.svg, width, height);
+        if (!isPlaying || generation !== pixelPrerenderGeneration) return;
+        pixelFrameCache.set(frame.id, png);
+      }
+      if (isPlaying && generation === pixelPrerenderGeneration) {
+        status = `Playing ${poses.length} pose${poses.length === 1 ? "" : "s"} at ${playbackFps} FPS · pixel frames ready`;
+      }
+    })().catch((error) => {
+      if (generation === pixelPrerenderGeneration) console.warn("Pixel playback prerender failed", error);
+    }).finally(() => {
+      if (generation === pixelPrerenderGeneration) pixelPrerenderPromise = null;
+    });
+    await pixelPrerenderPromise;
+  }
+  function schedulePreview(preservePlaybackCache = false) {
+    if (!preservePlaybackCache) {
+      clearPixelPrerenderCache();
+      if (isPlaying) queueMicrotask(() => void prerenderPixelFrames());
+    }
     previewRevision += 1;
     if (previewTimer) clearTimeout(previewTimer);
     // Native categorical supersampling is asynchronous, but collapsing rapid
     // slider changes still avoids rendering intermediate states nobody sees.
+    const delay = preservePlaybackCache ? 0 : aiPixelFilter ? 180 : 90;
     previewTimer = setTimeout(() => {
       previewTimer = null;
       void refreshPreview();
-    }, aiPixelFilter ? 180 : 90);
+    }, delay);
   }
   async function refreshPreview() {
     if (!svgHost || !previewCanvas || !sourceSvg) return;
@@ -1777,6 +1763,13 @@
   async function refreshPreviewFrame(revision: number) {
     const width = Math.max(1, Math.round(outputWidth));
     const height = Math.max(1, Math.round(outputHeight));
+    const cachedPlaybackFrame = isPlaying ? pixelFrameCache.get(activePoseId) : undefined;
+    if (cachedPlaybackFrame) {
+      await renderEncodedPixelPreview(cachedPlaybackFrame, previewCanvas, width, height);
+      if (revision !== previewRevision) return;
+      canvasBackend = `Playback cache · ${pixelFrameCache.size}/${poses.length} pixel frames`;
+      return;
+    }
     const svg = serializeForExport(svgHost);
     const useRasterizer = aiPixelFilter && isTauri();
     const paletteSize = Math.round(aiPaletteSize);
@@ -2142,7 +2135,7 @@
       <button class="new-pose" disabled={!sourceSvg} onclick={addPose}><span>＋</span><strong>NEW POSE</strong><small>SNAPSHOT CURRENT</small></button>
     </div>
     <div class="pose-actions">
-      <div class="playback-control"><button class:playing={isPlaying} disabled={!sourceSvg || poses.length === 0} onclick={togglePlayback}><span>{isPlaying ? "■" : "▶"}</span>{isPlaying ? "STOP" : "PLAY POSES"}</button><select aria-label="Playback speed" value={playbackFps} onchange={changePlaybackFps}><option value="1">1 FPS</option><option value="2">2 FPS</option><option value="4">4 FPS</option><option value="8">8 FPS</option></select></div>
+      <div class="playback-control"><button class:playing={isPlaying} disabled={!sourceSvg || poses.length === 0} onclick={togglePlayback}><span>{isPlaying ? "■" : "▶"}</span>{isPlaying ? "STOP" : "PLAY POSES"}</button><select aria-label="Playback speed" value={playbackFps} onchange={changePlaybackFps}><option value="1">1 FPS</option><option value="2">2 FPS</option><option value="4">4 FPS</option><option value="8">8 FPS</option><option value="12">12 FPS</option></select></div>
       <button class:active={onionSkin} class:paused={onionSkin && isPlaying} class="onion-skin-toggle" disabled={!sourceSvg || poses.length < 2} aria-pressed={onionSkin} onclick={toggleOnionSkin} title="Show previous pose in red and next pose in blue on the pixel canvas"><span class="onion-colors"><i></i><i></i></span><strong>ONION SKIN</strong><small>{onionSkin && isPlaying ? "PAUSED DURING PLAY" : "PREV 40% · NEXT 40%"}</small><b>{onionSkin ? "ON" : "OFF"}</b></button>
       <small class="frame-readout">{poses.length} POSE{poses.length === 1 ? "" : "S"} · {frameCount} EXPORT FRAME{frameCount === 1 ? "" : "S"}</small>
       {#if activePose}<input aria-label="Pose name" value={activePose.name} onchange={renamePose} /><button onclick={duplicatePose}>DUPLICATE</button>{:else}<span>REST PREVIEW · NOT EXPORTED</span>{/if}

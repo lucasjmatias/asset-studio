@@ -100,7 +100,7 @@ export function decodeAstdProject(contents: string): AstdProject {
     preferredRigEditMode: raw.preferredRigEditMode === "pose" ? "pose" : "setup",
     primaryView: raw.primaryView === "rig" || raw.primaryView === null ? raw.primaryView : "vector",
     pixelVisible: raw.pixelVisible === true,
-    playbackFps: [1, 2, 4, 8].includes(finiteNumber(raw.playbackFps, 2)) ? finiteNumber(raw.playbackFps, 2) : 2,
+    playbackFps: [1, 2, 4, 8, 12].includes(finiteNumber(raw.playbackFps, 2)) ? finiteNumber(raw.playbackFps, 2) : 2,
     onionSkin: raw.onionSkin === true,
     zoom: Math.max(0.25, Math.min(4, finiteNumber(raw.zoom, 1))),
   };

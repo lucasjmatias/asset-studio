@@ -1,13 +1,25 @@
-import type { SvgGroup } from "./model";
+import type { SvgGroup, SvgShape } from "./model";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const XLINK_NS = "http://www.w3.org/1999/xlink";
 const editableShapeSelector = "path,rect,circle,ellipse,polygon,polyline,line";
 const geometryAttributes = new Set(["d", "x", "y", "x1", "y1", "x2", "y2", "width", "height", "rx", "ry", "cx", "cy", "r", "points"]);
+const shapeGeometryAttributes = [...geometryAttributes, "transform"].sort();
+const shapePresentationAttributes = ["class", "fill", "fill-opacity", "opacity", "paint-order", "stroke", "stroke-dasharray", "stroke-linecap", "stroke-linejoin", "stroke-opacity", "stroke-width", "style", "vector-effect"];
+
+function attributeSignature(element: Element, names: string[]): string {
+  return names
+    .flatMap((name) => {
+      const value = element.getAttribute(name)?.trim().replace(/\s+/g, " ");
+      return value ? [`${name}=${value}`] : [];
+    })
+    .join("|");
+}
 
 export type PreparedSvg = {
   markup: string;
   groups: SvgGroup[];
+  shapes: SvgShape[];
   viewBox: [number, number, number, number];
   warnings: string[];
 };
@@ -153,20 +165,36 @@ export function prepareSvg(source: string): PreparedSvg {
   });
 
   let shapeIndex = 0;
+  const shapeOrdinals = new Map<string, number>();
+  const shapes: SvgShape[] = [];
   for (const shape of Array.from(root.querySelectorAll(editableShapeSelector))) {
     if (shape.closest("defs,clipPath,mask,marker,pattern,symbol")) continue;
     const owner = shape.closest("[data-studio-group]") as SVGElement | null;
     if (!owner?.dataset.studioGroup) continue;
-    shape.setAttribute("data-studio-shape", `shape-${shapeIndex++}`);
-    shape.setAttribute("data-studio-shape-group", owner.dataset.studioGroup);
+    const key = `shape-${shapeIndex++}`;
+    const groupKey = owner.dataset.studioGroup;
+    const ordinalInGroup = shapeOrdinals.get(groupKey) ?? 0;
+    shapeOrdinals.set(groupKey, ordinalInGroup + 1);
+    shape.setAttribute("data-studio-shape", key);
+    shape.setAttribute("data-studio-shape-group", groupKey);
     if (shape.localName.toLowerCase() === "path") {
       shape.setAttribute("data-studio-source-d", shape.getAttribute("d") || "");
     }
+    shapes.push({
+      key,
+      groupKey,
+      sourceId: shape.getAttribute("id"),
+      tagName: shape.localName.toLowerCase(),
+      geometrySignature: attributeSignature(shape, shapeGeometryAttributes),
+      presentationSignature: attributeSignature(shape, shapePresentationAttributes),
+      ordinalInGroup,
+    });
   }
 
   return {
     markup: new XMLSerializer().serializeToString(root),
     groups,
+    shapes,
     viewBox: viewBoxValues as [number, number, number, number],
     warnings: [...new Set(warnings)],
   };

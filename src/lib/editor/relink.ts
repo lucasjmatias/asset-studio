@@ -1,4 +1,4 @@
-import type { SvgGroup } from "./model";
+import type { SvgGroup, SvgShape } from "./model";
 
 function normalized(value: string | null | undefined): string {
   return (value ?? "").trim().toLocaleLowerCase();
@@ -74,6 +74,74 @@ export function replacementGroupMap(previous: SvgGroup[], next: SvgGroup[]): Rec
 }
 
 export function remapGroupRecord<T>(record: Record<string, T> | undefined, mapping: Record<string, string>): Record<string, T> {
+  return Object.fromEntries(
+    Object.entries(record ?? {}).flatMap(([key, value]) => mapping[key] ? [[mapping[key], value]] : []),
+  );
+}
+
+function uniqueShapeIndex(shapes: SvgShape[], signature: (shape: SvgShape) => string): Map<string, string> {
+  const candidates = new Map<string, string[]>();
+  for (const shape of shapes) {
+    const key = signature(shape);
+    if (!key) continue;
+    candidates.set(key, [...(candidates.get(key) ?? []), shape.key]);
+  }
+  return new Map<string, string>(
+    [...candidates.entries()]
+      .filter(([, values]) => values.length === 1)
+      .map(([key, values]) => [key, values[0]] as const),
+  );
+}
+
+/**
+ * Relinks pose-local Bézier overrides without trusting generated shape-N keys.
+ * Strong source/geometry identity wins. Ordinal fallback is allowed only when
+ * the mapped group retained the same number of shapes, preventing an inserted
+ * shadow curve from receiving an unrelated pose path.
+ */
+export function replacementShapeMap(
+  previous: SvgShape[],
+  next: SvgShape[],
+  groupMapping: Record<string, string>,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  const used = new Set<string>();
+  const nextById = uniqueShapeIndex(next, (shape) => shape.sourceId ? `${shape.groupKey}|${normalized(shape.sourceId)}` : "");
+  const nextByExactGeometry = uniqueShapeIndex(next, (shape) => `${shape.groupKey}|${shape.tagName}|${shape.geometrySignature}|${shape.presentationSignature}`);
+  const nextByGeometry = uniqueShapeIndex(next, (shape) => `${shape.groupKey}|${shape.tagName}|${shape.geometrySignature}`);
+  const previousCounts = new Map<string, number>();
+  const nextCounts = new Map<string, number>();
+  for (const shape of previous) previousCounts.set(shape.groupKey, (previousCounts.get(shape.groupKey) ?? 0) + 1);
+  for (const shape of next) nextCounts.set(shape.groupKey, (nextCounts.get(shape.groupKey) ?? 0) + 1);
+
+  const link = (oldKey: string, newKey: string | undefined) => {
+    if (!newKey || used.has(newKey)) return false;
+    result[oldKey] = newKey;
+    used.add(newKey);
+    return true;
+  };
+  const mappedSignature = (shape: SvgShape, detail: "id" | "exact" | "geometry") => {
+    const groupKey = groupMapping[shape.groupKey];
+    if (!groupKey) return "";
+    if (detail === "id") return shape.sourceId ? `${groupKey}|${normalized(shape.sourceId)}` : "";
+    if (detail === "exact") return `${groupKey}|${shape.tagName}|${shape.geometrySignature}|${shape.presentationSignature}`;
+    return `${groupKey}|${shape.tagName}|${shape.geometrySignature}`;
+  };
+
+  for (const shape of previous) link(shape.key, nextById.get(mappedSignature(shape, "id")));
+  for (const shape of previous) if (!result[shape.key]) link(shape.key, nextByExactGeometry.get(mappedSignature(shape, "exact")));
+  for (const shape of previous) if (!result[shape.key]) link(shape.key, nextByGeometry.get(mappedSignature(shape, "geometry")));
+  for (const shape of previous) {
+    if (result[shape.key]) continue;
+    const mappedGroup = groupMapping[shape.groupKey];
+    if (!mappedGroup || previousCounts.get(shape.groupKey) !== nextCounts.get(mappedGroup)) continue;
+    const candidate = next.find((item) => item.groupKey === mappedGroup && item.ordinalInGroup === shape.ordinalInGroup && item.tagName === shape.tagName);
+    if (candidate) link(shape.key, candidate.key);
+  }
+  return result;
+}
+
+export function remapShapeRecord<T>(record: Record<string, T> | undefined, mapping: Record<string, string>): Record<string, T> {
   return Object.fromEntries(
     Object.entries(record ?? {}).flatMap(([key, value]) => mapping[key] ? [[mapping[key], value]] : []),
   );

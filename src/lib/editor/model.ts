@@ -16,6 +16,16 @@ export type SvgGroup = {
   depth: number;
 };
 
+export type SvgShape = {
+  key: string;
+  groupKey: string;
+  sourceId: string | null;
+  tagName: string;
+  geometrySignature: string;
+  presentationSignature: string;
+  ordinalInGroup: number;
+};
+
 export type Bone = {
   id: string;
   name: string;
