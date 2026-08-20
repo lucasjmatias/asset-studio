@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { addPathNodeAfter, configurePathNode, movePathHandle, nodeIndexForHandle, parsePathData, pathArea, pathHandles, removePathNode, serializePathData } from "./shape";
+import { addPathNodeAfter, configurePathNode, deformPathWithBones, movePathHandle, nodeIndexForHandle, parsePathData, pathArea, pathHandles, removePathNode, serializePathData } from "./shape";
 
 describe("non-destructive vector paths", () => {
   it("normalizes relative and smooth commands into editable absolute commands", () => {
@@ -72,5 +72,16 @@ describe("non-destructive vector paths", () => {
     expect(pathHandles(lastSmooth).filter((handle) => handle.kind === "control" && nodeIndexForHandle(lastSmooth, handle) === 3)).toHaveLength(2);
     expect(pathArea(firstSmooth)).toBeCloseTo(pathArea(square), 6);
     expect(pathArea(lastSmooth)).toBeCloseTo(pathArea(square), 6);
+  });
+
+  it("deforms Bézier nodes between multiple pose bones while preserving pose volume", () => {
+    const source = parsePathData("M0 0 C0 10 10 10 10 0 L0 0 Z");
+    const deformed = deformPathWithBones(source, [
+      { start: { x: 0, y: 0 }, end: { x: 4, y: 0 }, matrix: [1, 0, 0, 1, 0, 4] },
+      { start: { x: 6, y: 0 }, end: { x: 10, y: 0 }, matrix: [1, 0, 0, 1, 0, -3] },
+    ]);
+
+    expect(deformed[0].values[1]).toBeGreaterThan(deformed[1].values[5]);
+    expect(pathArea(deformed)).toBeCloseTo(pathArea(source), 5);
   });
 });

@@ -15,6 +15,7 @@ struct PixelArtSettings {
     palette_size: u8,
     contour_strength: u8,
     preserve_details: u8,
+    coverage_threshold: u8,
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
@@ -247,6 +248,7 @@ fn categorical_pixels(
     height: usize,
     sample_scale: usize,
     palette: &[Rgb],
+    coverage_threshold: u8,
 ) -> Vec<Option<usize>> {
     let sample_width = samples.width() as usize;
     let mut labels = vec![None; width * height];
@@ -269,7 +271,10 @@ fn categorical_pixels(
                     votes[nearest_color(color, palette)] += alpha;
                 }
             }
-            if visible_weight * 2 >= full_weight {
+            // Coverage is measured before palette selection. This prevents a
+            // weak vector touch from becoming an unsupported fully opaque
+            // pixel while preserving the categorical (never blended) output.
+            if visible_weight * 100 >= full_weight * coverage_threshold.clamp(1, 100) as u32 {
                 labels[y * width + x] = votes
                     .iter()
                     .enumerate()
@@ -489,6 +494,7 @@ fn render_pixel_art_with_palette(
         height as usize,
         sample_scale as usize,
         &palette,
+        settings.coverage_threshold,
     );
     remove_tiny_clusters(
         &mut labels,
@@ -509,11 +515,13 @@ fn pixel_settings(
     palette_size: u8,
     contour_strength: u8,
     preserve_details: u8,
+    coverage_threshold: u8,
 ) -> PixelArtSettings {
     PixelArtSettings {
         palette_size: palette_size.clamp(2, 64),
         contour_strength: contour_strength.min(100),
         preserve_details: preserve_details.clamp(1, 4),
+        coverage_threshold: coverage_threshold.clamp(1, 100),
     }
 }
 
@@ -537,9 +545,15 @@ pub(crate) async fn render_pixel_png(
     palette_size: u8,
     contour_strength: u8,
     preserve_details: u8,
+    coverage_threshold: u8,
 ) -> Result<Vec<u8>, String> {
     run_blocking(move || {
-        let settings = pixel_settings(palette_size, contour_strength, preserve_details);
+        let settings = pixel_settings(
+            palette_size,
+            contour_strength,
+            preserve_details,
+            coverage_threshold,
+        );
         let palette = source_palette(&palette_svg, settings.palette_size as usize)?;
         render_pixel_art_with_palette(&svg, width, height, &resize_mode, settings, &palette)?
             .encode_png()
@@ -560,11 +574,17 @@ fn export_png_sync(
     palette_size: u8,
     contour_strength: u8,
     preserve_details: u8,
+    coverage_threshold: u8,
 ) -> Result<(), String> {
     let target = Path::new(&path);
     validate_png_path(target)?;
     let pixmap = if pixel_art {
-        let settings = pixel_settings(palette_size, contour_strength, preserve_details);
+        let settings = pixel_settings(
+            palette_size,
+            contour_strength,
+            preserve_details,
+            coverage_threshold,
+        );
         let palette = source_palette(&palette_svg, settings.palette_size as usize)?;
         render_pixel_art_with_palette(&svg, width, height, &resize_mode, settings, &palette)?
     } else {
@@ -589,6 +609,7 @@ pub(crate) async fn export_png(
     palette_size: u8,
     contour_strength: u8,
     preserve_details: u8,
+    coverage_threshold: u8,
 ) -> Result<(), String> {
     run_blocking(move || {
         export_png_sync(
@@ -603,6 +624,7 @@ pub(crate) async fn export_png(
             palette_size,
             contour_strength,
             preserve_details,
+            coverage_threshold,
         )
     })
     .await
@@ -620,6 +642,7 @@ fn export_tileset_sync(
     palette_size: u8,
     contour_strength: u8,
     preserve_details: u8,
+    coverage_threshold: u8,
 ) -> Result<(), String> {
     if svgs.is_empty() {
         return Err("The tileset needs at least one frame.".into());
@@ -634,7 +657,12 @@ fn export_tileset_sync(
         })?;
     let target = Path::new(&path);
     validate_png_path(target)?;
-    let settings = pixel_settings(palette_size, contour_strength, preserve_details);
+    let settings = pixel_settings(
+        palette_size,
+        contour_strength,
+        preserve_details,
+        coverage_threshold,
+    );
     let palette = if pixel_art {
         source_palette(&palette_svg, settings.palette_size as usize)?
     } else {
@@ -676,6 +704,7 @@ pub(crate) async fn export_tileset(
     palette_size: u8,
     contour_strength: u8,
     preserve_details: u8,
+    coverage_threshold: u8,
 ) -> Result<(), String> {
     run_blocking(move || {
         export_tileset_sync(
@@ -690,6 +719,7 @@ pub(crate) async fn export_tileset(
             palette_size,
             contour_strength,
             preserve_details,
+            coverage_threshold,
         )
     })
     .await
@@ -701,8 +731,19 @@ mod tests {
     const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="10" height="16" fill="#ef6247"/><rect x="10" width="6" height="16" fill="#13c879"/></svg>"##;
 
     #[test]
+    fn coverage_threshold_rejects_weak_vector_touches() {
+        let mut samples = tiny_skia::Pixmap::new(4, 4).unwrap();
+        for pixel in samples.data_mut().chunks_exact_mut(4).take(7) {
+            pixel.copy_from_slice(&[0, 0, 0, 255]);
+        }
+        let palette = [Rgb { r: 0, g: 0, b: 0 }];
+        assert_eq!(categorical_pixels(&samples, 1, 1, 4, &palette, 40), vec![Some(0)]);
+        assert_eq!(categorical_pixels(&samples, 1, 1, 4, &palette, 50), vec![None]);
+    }
+
+    #[test]
     fn pixel_art_has_binary_alpha_and_source_colors_only() {
-        let settings = pixel_settings(8, 60, 1);
+        let settings = pixel_settings(8, 60, 1, 50);
         let palette = source_palette(SVG, 8).unwrap();
         let pixmap =
             render_pixel_art_with_palette(SVG, 19, 19, "contain", settings, &palette).unwrap();
@@ -720,7 +761,7 @@ mod tests {
 
     #[test]
     fn categorical_rasterizer_does_not_create_blended_seam_colors() {
-        let settings = pixel_settings(8, 60, 1);
+        let settings = pixel_settings(8, 60, 1, 50);
         let palette = source_palette(SVG, 8).unwrap();
         let pixmap =
             render_pixel_art_with_palette(SVG, 13, 11, "stretch", settings, &palette).unwrap();
@@ -789,6 +830,7 @@ mod tests {
             8,
             60,
             1,
+            50,
         )
         .unwrap();
         let pixmap = tiny_skia::Pixmap::load_png(&path).unwrap();

@@ -6,13 +6,14 @@
   import initStudioCore, { transform_matrix } from "$lib/wasm/studio_core.js";
   import { composeBoneTransform, createPose, identityBoneTransform, identityTransform, relativeBoneTransform, type Bone, type BonePoseTransform, type GroupTransform, type NodeMode, type PixelResizeMode, type Pose, type SvgGroup } from "$lib/editor/model";
   import { applyShapePath, applyShapePaths, highlightBoneWrapper, prepareSvg, selectWrapper, serializeForExport, setWrapperMatrix, setWrapperVisibility, shapeElementToPathData } from "$lib/editor/svg";
-  import { loadCanvasKit, rasterizeSvg, renderEncodedPixelPreview, renderPixelPreview } from "$lib/editor/pixel-preview";
-  import { boneDepth, boneGroupMatrices, boneWorldMap, composeGroupLocalMatrices, dominantSampleOwner, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, translateBoneEndpoints, wouldCreateCycle, type Matrix } from "$lib/editor/rig";
+  import { encodedPngToCanvas, loadCanvasKit, overlayOnionSkins, rasterizeSvg, renderEncodedPixelPreview, renderPixelPreview } from "$lib/editor/pixel-preview";
+  import { boneDepth, boneGroupMatrices, boneTransformFromLocalMatrix, boneWorldMap, childBoneTargetGroup, childWorldMatrixWithoutInheritedScale, composeGroupLocalMatrices, dominantSampleOwner, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, orientBoneStartToward, translateBoneEndpoints, wouldCreateCycle, type Matrix, type RigGroupTarget } from "$lib/editor/rig";
   import { appendHistory, cloneSerializable, snapshotsEqual, type HistoryEntry } from "$lib/editor/history";
   import { decodeAstdProject, encodeAstdProject, type AstdProjectState } from "$lib/editor/project";
   import { remapGroupRecord, replacementGroupMap } from "$lib/editor/relink";
   import { clampCanvasZoom, outputPixelDelta, zoomPanAroundAnchor } from "$lib/editor/viewport";
-  import { addPathNodeAfter, configurePathNode, movePathHandle, nodeIndexForHandle, parsePathData, pathArea, pathControlGuides, pathHandles, removePathNode, serializePathData, type ControlGuide, type PathCommand, type PathHandle } from "$lib/editor/shape";
+  import { addPathNodeAfter, configurePathNode, deformPathWithBones, movePathHandle, nodeIndexForHandle, parsePathData, pathArea, pathControlGuides, pathHandles, removePathNode, serializePathData, type ControlGuide, type PathBoneInfluence, type PathCommand, type PathHandle } from "$lib/editor/shape";
+  import { steppedPoseId, wrappedPoseNeighbors } from "$lib/editor/animation";
   import "./studio.css";
 
   type EditorTool = "move" | "rotate" | "scale" | "shape";
@@ -20,10 +21,10 @@
   type RigEditMode = "setup" | "pose";
   type BoneGesture = "move" | "rotate-start" | "rotate-end" | "scale-start" | "scale-end";
   type PrimaryView = "vector" | "rig";
-  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; preferredRigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; pixelContourStrength?: number; pixelDetailFloor?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number; zoom?: number; canvasPan?: { x: number; y: number } };
+  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; preferredRigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; pixelContourStrength?: number; pixelDetailFloor?: number; pixelCoverageThreshold?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; onionSkin?: boolean; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number; zoom?: number; canvasPan?: { x: number; y: number } };
   type DocumentSnapshot = { poses: Pose[]; bones: Bone[]; setupBoneTransforms: Record<string, BonePoseTransform>; activePoseId: string; selectedGroupKey: string | null; selectedBoneId: string | null };
   type DragState = { pointerId: number; key: string; startPoint: { x: number; y: number }; startTransform: GroupTransform; inverse: DOMMatrix; rootToTool: Matrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number; historyBefore: DocumentSnapshot };
-  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; didMove: boolean; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; historyBefore: DocumentSnapshot };
+  type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; didMove: boolean; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startMatrix: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; startChildMatrices: Record<string, Matrix>; historyBefore: DocumentSnapshot };
   type PanDragState = { pointerId: number; startClient: { x: number; y: number }; startPan: { x: number; y: number } };
   type GroupHitArea = { key: string; depth: number; area: number; box: { x: number; y: number; width: number; height: number }; rootToLocal: Matrix };
   type SelectionOverlay = { key: string; x: number; y: number; width: number; height: number; matrix: string; kind: "selection" | "bone" };
@@ -63,6 +64,7 @@
   let aiPaletteSize = $state(16);
   let pixelContourStrength = $state(60);
   let pixelDetailFloor = $state(2);
+  let pixelCoverageThreshold = $state(55);
   let activeTool = $state<EditorTool>("move");
   let modalTool = $state<ModalTransformTool | null>(null);
   let modalReturnTool: EditorTool = "move";
@@ -87,6 +89,7 @@
   let projectPath = $state<string | null>(null);
   let isPlaying = $state(false);
   let playbackFps = $state(2);
+  let onionSkin = $state(false);
   let playbackTimer: ReturnType<typeof setTimeout> | null = null;
   let drag: DragState | null = null;
   let boneDrag = $state<BoneDragState | null>(null);
@@ -106,6 +109,7 @@
   const pivots: Record<string, { x: number; y: number }> = {};
   const worldPivots: Record<string, { x: number; y: number }> = {};
   const wrapperParentMatrices: Record<string, Matrix> = {};
+  const shapeToRootMatrices: Record<string, Matrix> = {};
 
   const activePose = $derived(poses.find((pose) => pose.id === activePoseId) ?? null);
   const selectedGroup = $derived(groups.find((group) => group.key === selectedGroupKey) ?? null);
@@ -114,6 +118,16 @@
   // decides whether the artwork is frozen or follows those guides.
   const boneWorlds = $derived(boneWorldMap(bones, effectiveBoneTransforms(activePose)));
   const renderedBones = $derived([...bones].sort((left, right) => Number(left.id === selectedBoneId) - Number(right.id === selectedBoneId)));
+  const canvasTransformMode = $derived(modalTool ?? (viewMode === "vector" && activeTool !== "shape" ? activeTool : null));
+  const canvasToolCursor = $derived(
+    canvasTransformMode === "move"
+      ? moveCursor
+      : canvasTransformMode === "rotate"
+        ? rotateCursor
+        : canvasTransformMode === "scale"
+          ? resizeCursor(viewMode === "rig" && selectedBoneId ? boneWorlds[selectedBoneId]?.angle ?? -45 : -45)
+          : "default",
+  );
   const canEdit = $derived(Boolean(sourceSvg && activePose));
   const frameCount = $derived(poses.length);
   const projectName = $derived(projectPath?.split(/[\\/]/).pop() ?? "UNSAVED .ASTD");
@@ -180,12 +194,14 @@
       aiPaletteSize = Math.max(2, Math.min(64, session.aiPaletteSize || 16));
       pixelContourStrength = Math.max(0, Math.min(100, session.pixelContourStrength ?? 60));
       pixelDetailFloor = Math.max(1, Math.min(4, session.pixelDetailFloor ?? 2));
+      pixelCoverageThreshold = Math.max(10, Math.min(90, session.pixelCoverageThreshold ?? 55));
       preferredRigEditMode = session.preferredRigEditMode === "pose" || session.rigEditMode === "pose" ? "pose" : "setup";
       rigEditMode = restoredActivePoseId === "rest" ? "setup" : preferredRigEditMode;
       viewMode = session.primaryView === "rig" || session.primaryView === null ? session.primaryView : "vector";
       pixelVisible = session.pixelVisible === true;
       if (!viewMode && !pixelVisible) viewMode = "vector";
       playbackFps = [1, 2, 4, 8].includes(session.playbackFps || 0) ? session.playbackFps! : 2;
+      onionSkin = session.onionSkin === true;
       zoom = Math.max(0.25, Math.min(4, session.zoom ?? 1));
       canvasPan = Number.isFinite(session.canvasPan?.x) && Number.isFinite(session.canvasPan?.y)
         ? { x: session.canvasPan!.x, y: session.canvasPan!.y }
@@ -262,8 +278,14 @@
     const a = cosine * transform.scaleX, b = sine * transform.scaleX, c = -sine * transform.scaleY, d = cosine * transform.scaleY;
     return [a, b, c, d, transform.x + transform.pivotX - a * transform.pivotX - c * transform.pivotY, transform.y + transform.pivotY - b * transform.pivotX - d * transform.pivotY];
   }
+  function multiBoneGroupKeys(): Set<string> {
+    const counts = new Map<string, number>();
+    for (const bone of bones) if (bone.groupKey) counts.set(bone.groupKey, (counts.get(bone.groupKey) ?? 0) + 1);
+    return new Set(Array.from(counts.entries()).filter(([, count]) => count > 1).map(([key]) => key));
+  }
   function calculatedGroupMatricesFor(pose: Pose | null): Record<string, Matrix> {
     const rigMatrices = boneGroupMatrices(bones, effectiveBoneTransforms(pose), setupBoneTransforms);
+    for (const key of multiBoneGroupKeys()) delete rigMatrices[key];
     const directMatrices = Object.fromEntries(groups.map((group) => [group.key, matrixFor(transformForPose(group.key, pose)) as Matrix]));
     return composeGroupLocalMatrices(groups, wrapperParentMatrices, rigMatrices, directMatrices);
   }
@@ -344,6 +366,50 @@
     if (overlayFrame !== null) cancelAnimationFrame(overlayFrame);
     overlayFrame = requestAnimationFrame(refreshEditorOverlay);
   }
+  function applyPoseShapePaths(pose: Pose | null, deformFromRig: boolean) {
+    applyShapePaths(svgHost, pose?.shapePaths ?? {});
+    if (!pose || !deformFromRig) return;
+
+    const restWorlds = boneWorldMap(bones, setupBoneTransforms);
+    const posedWorlds = boneWorldMap(bones, effectiveBoneTransforms(pose));
+    for (const groupKey of multiBoneGroupKeys()) {
+      const groupBones = bones.filter((bone) => bone.groupKey === groupKey);
+      const movedBones = groupBones.filter((bone) => {
+        const rest = restWorlds[bone.id]?.matrix;
+        const posed = posedWorlds[bone.id]?.matrix;
+        return rest && posed && posed.some((value, index) => Math.abs(value - rest[index]) > 1e-7);
+      });
+      if (movedBones.length === 0) continue;
+
+      for (const original of editableShapesForGroup(groupKey)) {
+        const shapeKey = original.dataset.studioShape;
+        const sourceD = shapeElementToPathData(original);
+        const localToRoot = shapeKey ? shapeToRootMatrices[shapeKey] : null;
+        if (!shapeKey || !sourceD || !localToRoot) continue;
+        const rootToLocal = invertMatrix(localToRoot);
+        const influences = groupBones.flatMap((bone): PathBoneInfluence[] => {
+          const rest = restWorlds[bone.id];
+          const posed = posedWorlds[bone.id];
+          if (!rest || !posed) return [];
+          const deltaRoot = multiplyMatrix(posed.matrix, invertMatrix(rest.matrix));
+          const localDelta = multiplyMatrix(multiplyMatrix(rootToLocal, deltaRoot), localToRoot);
+          return [{
+            start: pointWithMatrix(rootToLocal, rest.startX, rest.startY),
+            end: pointWithMatrix(rootToLocal, rest.endX, rest.endY),
+            matrix: localDelta,
+          }];
+        });
+        if (influences.length < 2) continue;
+        try {
+          const baseCommands = parsePathData(pose.shapePaths?.[shapeKey] ?? sourceD);
+          const deformed = deformPathWithBones(baseCommands, influences, true);
+          applyShapePath(svgHost, shapeKey, serializePathData(deformed));
+        } catch (error) {
+          console.warn("Unable to skin SVG path from its pose bones", error);
+        }
+      }
+    }
+  }
   function applyAllTransforms() {
     if (!svgHost) return;
     const calculated = calculatedGroupMatrices();
@@ -352,7 +418,7 @@
       setWrapperMatrix(svgHost, group.key, freezeRig && setupFrozenMatrices[group.key] ? setupFrozenMatrices[group.key] : calculated[group.key]);
       setWrapperVisibility(svgHost, group.key, groupIsVisible(group.key));
     }
-    applyShapePaths(svgHost, activePose?.shapePaths ?? {});
+    applyPoseShapePaths(activePose, rigEditMode === "pose" || isPlaying);
     selectWrapper(svgHost, selectedGroupKey);
     highlightBoneWrapper(svgHost, selectedBone?.groupKey ?? null);
     scheduleEditorOverlay();
@@ -442,30 +508,54 @@
   }
   function collectPivots() {
     const root = svgHost.querySelector("svg");
+    const studioWrappers = Array.from(svgHost.querySelectorAll("[data-studio-group]")) as SVGGElement[];
+    const wrapperTransforms = studioWrappers.map((wrapper) => wrapper.getAttribute("transform"));
+    // Measure the source coordinate systems, never a pose/setup wrapper. The
+    // attributes are restored synchronously before the browser paints.
+    for (const wrapper of studioWrappers) wrapper.removeAttribute("transform");
+    for (const key of Object.keys(pivots)) delete pivots[key];
+    for (const key of Object.keys(worldPivots)) delete worldPivots[key];
+    for (const key of Object.keys(wrapperParentMatrices)) delete wrapperParentMatrices[key];
+    for (const key of Object.keys(shapeToRootMatrices)) delete shapeToRootMatrices[key];
     const rootCtm = root?.getCTM();
     const rootInverse = rootCtm?.inverse();
-    for (const group of groups) {
-      const wrapper = svgHost.querySelector(`[data-studio-group="${CSS.escape(group.key)}"]`) as SVGGElement | null;
-      if (!wrapper) continue;
-      try {
-        const box = wrapper.getBBox();
-        const localPivot = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-        pivots[group.key] = localPivot;
-        const parentCtm = (wrapper.parentElement as SVGGraphicsElement | null)?.getCTM();
-        if (rootInverse && parentCtm) {
-          const relative = rootInverse.multiply(parentCtm);
-          const matrix: Matrix = [relative.a, relative.b, relative.c, relative.d, relative.e, relative.f];
-          wrapperParentMatrices[group.key] = matrix;
-          worldPivots[group.key] = pointWithMatrix(matrix, localPivot.x, localPivot.y);
-        } else {
+    try {
+      for (const group of groups) {
+        const wrapper = svgHost.querySelector(`[data-studio-group="${CSS.escape(group.key)}"]`) as SVGGElement | null;
+        if (!wrapper) continue;
+        try {
+          const box = wrapper.getBBox();
+          const localPivot = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+          pivots[group.key] = localPivot;
+          const parentCtm = (wrapper.parentElement as SVGGraphicsElement | null)?.getCTM();
+          if (rootInverse && parentCtm) {
+            const relative = rootInverse.multiply(parentCtm);
+            const matrix: Matrix = [relative.a, relative.b, relative.c, relative.d, relative.e, relative.f];
+            wrapperParentMatrices[group.key] = matrix;
+            worldPivots[group.key] = pointWithMatrix(matrix, localPivot.x, localPivot.y);
+          } else {
+            wrapperParentMatrices[group.key] = [1, 0, 0, 1, 0, 0];
+            worldPivots[group.key] = localPivot;
+          }
+        } catch {
+          pivots[group.key] = { x: 0, y: 0 };
+          worldPivots[group.key] = { x: 0, y: 0 };
           wrapperParentMatrices[group.key] = [1, 0, 0, 1, 0, 0];
-          worldPivots[group.key] = localPivot;
         }
-      } catch {
-        pivots[group.key] = { x: 0, y: 0 };
-        worldPivots[group.key] = { x: 0, y: 0 };
-        wrapperParentMatrices[group.key] = [1, 0, 0, 1, 0, 0];
       }
+      if (root && rootInverse) for (const shape of Array.from(svgHost.querySelectorAll("[data-studio-shape]"))) {
+        const key = (shape as SVGElement).dataset.studioShape;
+        const ctm = (shape as SVGGraphicsElement).getCTM?.();
+        if (!key || !ctm) continue;
+        const relative = rootInverse.multiply(ctm);
+        shapeToRootMatrices[key] = [relative.a, relative.b, relative.c, relative.d, relative.e, relative.f];
+      }
+    } finally {
+      studioWrappers.forEach((wrapper, index) => {
+        const transform = wrapperTransforms[index];
+        if (transform === null) wrapper.removeAttribute("transform");
+        else wrapper.setAttribute("transform", transform);
+      });
     }
   }
   async function loadSvgSource(svg: string, name: string, persist = true) {
@@ -567,10 +657,12 @@
       aiPaletteSize,
       pixelContourStrength,
       pixelDetailFloor,
+      pixelCoverageThreshold,
       preferredRigEditMode,
       primaryView: viewMode,
       pixelVisible,
       playbackFps,
+      onionSkin,
       zoom,
     };
   }
@@ -587,12 +679,13 @@
     outputWidth = saved.outputWidth; outputHeight = saved.outputHeight; antiAlias = saved.antiAlias; resizeMode = saved.resizeMode;
     aiPixelFilter = saved.aiPixelFilter; aiPaletteSize = saved.aiPaletteSize;
     pixelContourStrength = saved.pixelContourStrength; pixelDetailFloor = saved.pixelDetailFloor;
+    pixelCoverageThreshold = saved.pixelCoverageThreshold;
     preferredRigEditMode = saved.preferredRigEditMode;
     rigEditMode = activePoseId === "rest" ? "setup" : preferredRigEditMode;
     viewMode = saved.primaryView; pixelVisible = saved.pixelVisible;
     if (!viewMode && !pixelVisible) viewMode = "vector";
     leftMode = viewMode === "rig" ? "rig" : "groups";
-    playbackFps = saved.playbackFps; zoom = saved.zoom; canvasPan = { x: 0, y: 0 };
+    playbackFps = saved.playbackFps; onionSkin = saved.onionSkin; zoom = saved.zoom; canvasPan = { x: 0, y: 0 };
     projectPath = pathOrName; undoStack = []; redoStack = []; dirty = false;
     requestAnimationFrame(() => {
       collectPivots();
@@ -651,6 +744,25 @@
     scheduleEditorOverlay();
     return true;
   }
+  function clearEditorSelection() {
+    selectedGroupKey = null;
+    selectedBoneId = null;
+    selectedShapeKey = null;
+    selectedShapeNodeIndex = null;
+    selectionOverlay = null;
+    shapeEditor = null;
+    selectWrapper(svgHost, null);
+    highlightBoneWrapper(svgHost, null);
+    scheduleEditorOverlay();
+    status = "Selection cleared · Left / Right changes pose";
+  }
+  function stepPoseView(direction: -1 | 1) {
+    const id = steppedPoseId(poses, activePoseId, direction);
+    if (!id) { status = "Create at least one pose before using Left / Right navigation."; return; }
+    choosePose(id);
+    const pose = poses.find((item) => item.id === id);
+    status = `Pose view · ${pose?.name ?? id}`;
+  }
   function addPose() {
     if (!sourceSvg) return;
     const before = captureDocument();
@@ -704,6 +816,15 @@
     playbackTimer = setTimeout(playbackStep, 1000 / playbackFps);
     status = `Playing ${poses.length} pose${poses.length === 1 ? "" : "s"} at ${playbackFps} FPS`;
   }
+  function toggleOnionSkin() {
+    onionSkin = !onionSkin;
+    dirty = true;
+    schedulePreview();
+    schedulePersist();
+    status = onionSkin
+      ? "Onion skin enabled · previous red 40% · next blue 40%"
+      : "Onion skin disabled";
+  }
   function changePlaybackFps(event: Event) {
     playbackFps = Number((event.currentTarget as HTMLSelectElement).value) || 2;
     if (isPlaying) { if (playbackTimer) clearTimeout(playbackTimer); playbackTimer = setTimeout(playbackStep, 1000 / playbackFps); }
@@ -745,11 +866,38 @@
     const value = Number((event.currentTarget as HTMLInputElement).value);
     if (Number.isFinite(value)) updateTransform(selectedGroupKey, { ...currentTransform(selectedGroupKey), [field]: value });
   }
-  function resetSelected() {
+  function resetSelectedGroupToRest() {
     if (!selectedGroupKey || !activePose) return;
-    if (activeTool === "shape" && shapeEditor) { resetSelectedShape(); return; }
-    const pivot = pivots[selectedGroupKey] ?? { x: 0, y: 0 };
-    updateTransform(selectedGroupKey, { ...identityTransform(), pivotX: pivot.x, pivotY: pivot.y });
+    const before = captureDocument();
+    const groupKey = selectedGroupKey;
+    const groupLabel = selectedGroup?.label ?? "Group";
+    const poseId = activePose.id;
+    const poseName = activePose.name;
+    const shapeKeys = new Set(
+      Array.from(svgHost.querySelectorAll(`[data-studio-shape-group="${CSS.escape(groupKey)}"]`))
+        .map((element) => (element as SVGElement).dataset.studioShape)
+        .filter((key): key is string => Boolean(key)),
+    );
+    poses = poses.map((pose) => {
+      if (pose.id !== poseId) return pose;
+      const transforms = { ...pose.transforms };
+      const visibility = { ...(pose.visibility ?? {}) };
+      const shapePaths = { ...(pose.shapePaths ?? {}) };
+      const shapeNodeModes = { ...(pose.shapeNodeModes ?? {}) };
+      delete transforms[groupKey];
+      delete visibility[groupKey];
+      for (const shapeKey of shapeKeys) {
+        delete shapePaths[shapeKey];
+        delete shapeNodeModes[shapeKey];
+      }
+      return { ...pose, transforms, visibility, shapePaths, shapeNodeModes };
+    });
+    applyAllTransforms();
+    commitHistory(`Reset ${groupLabel} to Rest`, before);
+    dirty = true;
+    schedulePreview();
+    schedulePersist();
+    status = `${groupLabel} restored to Rest in ${poseName}`;
   }
   function currentShapeNodeModes(): Record<string, NodeMode> {
     if (!activePose || !shapeEditor) return {};
@@ -896,7 +1044,7 @@
         [...bones, bone],
         { ...effectiveBoneTransforms(activePose), [bone.id]: identityBoneTransform() },
       )[bone.id];
-      const fitted = fitBoneToGroupBounds({
+      let fitted = fitBoneToGroupBounds({
         x: box.x,
         y: box.y,
         width: box.width,
@@ -907,6 +1055,9 @@
         y: currentWorld.endY - currentWorld.startY,
       } : undefined);
       if (!fitted) return null;
+
+      const parentTip = bone.parentId ? boneWorlds[bone.parentId] : null;
+      if (parentTip) fitted = orientBoneStartToward(fitted, { x: parentTip.endX, y: parentTip.endY });
 
       const parentMatrix = bone.parentId ? boneWorlds[bone.parentId]?.matrix : null;
       const parentInverse = parentMatrix ? invertMatrix(parentMatrix) : [1, 0, 0, 1, 0, 0] as Matrix;
@@ -977,22 +1128,33 @@
     });
     return dominantSampleOwner(owners, 0.6);
   }
-  function autoBindMovedBone(boneId: string): string | null {
+  function autoBindMovedBone(boneId: string): { label: string; fitted: boolean; multi: boolean } | null {
     if (rigEditMode !== "setup") return null;
     const bone = bones.find((item) => item.id === boneId);
     const world = boneWorlds[boneId];
     if (!bone || !world) return null;
     const overlap = dominantGroupForBone(world);
     if (!overlap || overlap.key === bone.groupKey) return null;
-    const fitted = fittedBoneForGroup({ ...bone, groupKey: overlap.key }, overlap.key);
-    if (!fitted) return null;
-    bones = bones.map((item) => item.id === boneId
-      ? fitted.bone
-      : item.groupKey === overlap.key ? { ...item, groupKey: null } : item);
-    setupBoneTransforms = { ...setupBoneTransforms, [boneId]: fitted.setup };
+    const groupAlreadyRigged = bones.some((item) => item.id !== boneId && item.groupKey === overlap.key);
+    const fitted = groupAlreadyRigged ? null : fittedBoneForGroup({ ...bone, groupKey: overlap.key }, overlap.key);
+    // Binding is authoritative and must not depend on getBBox/fit support.
+    // Some valid SVG groups can be hit-tested but cannot produce a stable box
+    // in the current rendered pose. In that case keep the moved geometry and
+    // still persist the group relationship.
+    const groupLabel = groups.find((group) => group.key === overlap.key)?.label ?? bone.name;
+    const boundBone: Bone = { ...(fitted?.bone ?? bone), groupKey: overlap.key, name: groupLabel };
+    bones = bones.map((item) => item.id === boneId ? boundBone : item);
+    if (fitted) setupBoneTransforms = { ...setupBoneTransforms, [boneId]: fitted.setup };
+    selectedBoneId = boneId;
     selectedGroupKey = overlap.key;
-    applyAllTransforms(); schedulePersist();
-    return groups.find((group) => group.key === overlap.key)?.label ?? overlap.key;
+    dirty = true;
+    applyAllTransforms();
+    schedulePersist();
+    return {
+      label: groupLabel,
+      fitted: Boolean(fitted),
+      multi: groupAlreadyRigged,
+    };
   }
   function fitSelectedBoneToGroup() {
     if (!selectedBone?.groupKey || rigEditMode !== "setup") return;
@@ -1005,35 +1167,59 @@
     commitHistory("Fit bone to group", before);
     status = `${fitted.bone.name} centered and fitted to ${groups.find((group) => group.key === fitted.bone.groupKey)?.label}`;
   }
+  function rigGroupTargets(): RigGroupTarget[] {
+    return groups.flatMap((group, order) => {
+      const wrapper = svgHost.querySelector(`[data-studio-group="${CSS.escape(group.key)}"]`) as SVGGElement | null;
+      const matrix = wrapperParentMatrices[group.key];
+      if (!wrapper || !matrix) return [];
+      try {
+        const box = wrapper.getBBox();
+        const center = pointWithMatrix(matrix, box.x + box.width / 2, box.y + box.height / 2);
+        const width = Math.hypot(matrix[0] * box.width, matrix[1] * box.width);
+        const height = Math.hypot(matrix[2] * box.height, matrix[3] * box.height);
+        const diameter = Math.max(width, height);
+        return diameter > 1e-6 ? [{ key: group.key, centerX: center.x, centerY: center.y, diameter, order }] : [];
+      } catch {
+        return [];
+      }
+    });
+  }
   function addBone() {
     if (!sourceSvg) return;
     const before = captureDocument();
     const parent = bones.find((bone) => bone.id === selectedBoneId) ?? null;
-    const pivot = selectedGroupKey ? worldPivots[selectedGroupKey] : null;
-    const group = groups.find((item) => item.key === selectedGroupKey);
-    const parentWorld = parent ? boneWorldMap(bones)[parent.id] : null;
+    const parentWorld = parent ? boneWorlds[parent.id] : null;
+    const occupiedGroups = new Set(bones.flatMap((bone) => bone.groupKey ? [bone.groupKey] : []));
+    const targetGroupKey = parent && parentWorld
+      ? childBoneTargetGroup(parent.groupKey ?? selectedGroupKey, parentWorld, rigGroupTargets(), occupiedGroups)
+      : selectedGroupKey;
+    const pivot = targetGroupKey ? worldPivots[targetGroupKey] : null;
+    const group = groups.find((item) => item.key === targetGroupKey);
     const targetDistance = parentWorld && pivot ? Math.hypot(pivot.x - parentWorld.endX, pivot.y - parentWorld.endY) : 0;
     const targetAngle = parentWorld && pivot ? Math.atan2(pivot.y - parentWorld.endY, pivot.x - parentWorld.endX) * 180 / Math.PI : 0;
     const bone: Bone = {
       id: crypto.randomUUID(),
-      name: group?.label ? `${group.label} bone` : `Bone ${String(bones.length + 1).padStart(2, "0")}`,
+      name: group?.label ?? `Bone ${String(bones.length + 1).padStart(2, "0")}`,
       parentId: parent?.id ?? null,
-      groupKey: selectedGroupKey,
+      groupKey: targetGroupKey,
       x: parent ? parent.length : (pivot?.x ?? viewBox[0] + viewBox[2] / 2),
       y: parent ? 0 : (pivot?.y ?? viewBox[1] + viewBox[3] / 2),
       length: parent ? Math.max(12, targetDistance || parent.length * 0.72) : Math.max(32, Math.min(viewBox[2], viewBox[3]) * 0.16),
       restRotation: parentWorld && pivot ? targetAngle - parentWorld.angle : 0,
     };
-    const fitted = bone.groupKey ? fittedBoneForGroup(bone, bone.groupKey) : null;
+    const groupAlreadyRigged = Boolean(bone.groupKey && bones.some((item) => item.groupKey === bone.groupKey));
+    const fitted = bone.groupKey && !groupAlreadyRigged ? fittedBoneForGroup(bone, bone.groupKey) : null;
     const placedBone = fitted?.bone ?? bone;
-    bones = [...bones.map((item) => item.groupKey === placedBone.groupKey ? { ...item, groupKey: null } : item), placedBone];
+    bones = [...bones, placedBone];
     if (fitted) setupBoneTransforms = { ...setupBoneTransforms, [placedBone.id]: fitted.setup };
-    selectedBoneId = placedBone.id; showRig();
+    selectedBoneId = placedBone.id; selectedGroupKey = placedBone.groupKey; showRig();
     applyAllTransforms(); schedulePersist();
     commitHistory("Add bone", before);
     status = fitted
       ? `${placedBone.name} centered and fitted to ${group?.label}`
-      : parent ? `${placedBone.name} added as a child of ${parent.name}` : `${placedBone.name} root created`;
+      : groupAlreadyRigged
+        ? `${placedBone.name} added to ${group?.label} · multiple pose bones will deform its Bézier nodes at constant volume`
+        : parent ? `${placedBone.name} added as a child of ${parent.name}` : `${placedBone.name} root created`;
   }
   function updateBone(next: Bone, label = "Edit bone") {
     const before = captureDocument();
@@ -1062,16 +1248,23 @@
     if (!selectedBone) return;
     const before = captureDocument();
     const groupKey = (event.currentTarget as HTMLSelectElement).value || null;
-    const fitted = groupKey ? fittedBoneForGroup({ ...selectedBone, groupKey }, groupKey) : null;
-    const nextSelected = fitted?.bone ?? { ...selectedBone, groupKey };
-    bones = bones.map((bone) => bone.id === selectedBone.id
-      ? nextSelected
-      : groupKey && bone.groupKey === groupKey ? { ...bone, groupKey: null } : bone);
+    const groupAlreadyRigged = Boolean(groupKey && bones.some((bone) => bone.id !== selectedBone.id && bone.groupKey === groupKey));
+    const fitted = groupKey && !groupAlreadyRigged ? fittedBoneForGroup({ ...selectedBone, groupKey }, groupKey) : null;
+    const groupLabel = groups.find((group) => group.key === groupKey)?.label;
+    const nextSelected = {
+      ...(fitted?.bone ?? { ...selectedBone, groupKey }),
+      ...(groupKey && groupLabel ? { name: groupLabel } : {}),
+    };
+    bones = bones.map((bone) => bone.id === selectedBone.id ? nextSelected : bone);
     if (fitted) setupBoneTransforms = { ...setupBoneTransforms, [selectedBone.id]: fitted.setup };
     applyAllTransforms(); schedulePersist();
     commitHistory(groupKey ? "Bind and fit bone to group" : "Unbind bone from group", before);
     status = groupKey
-      ? fitted ? `${selectedBone.name} bound, centered, and fitted to ${groups.find((group) => group.key === groupKey)?.label}` : `${selectedBone.name} bound to an empty group`
+      ? fitted
+        ? `${nextSelected.name} bound, centered, and fitted to ${groupLabel}`
+        : groupAlreadyRigged
+          ? `${nextSelected.name} joined ${groupLabel} · Pose changes will deform its nodes at constant volume`
+          : `${nextSelected.name} bound to an empty group`
       : `${selectedBone.name} unbound`;
   }
   function deleteBone() {
@@ -1106,6 +1299,53 @@
     schedulePersist();
     if (before) commitHistory("Adjust rig setup", before);
   }
+  function directChildWorldMatrices(parentId: string): Record<string, Matrix> {
+    return Object.fromEntries(bones.flatMap((bone) => {
+      const world = bone.parentId === parentId ? boneWorlds[bone.id] : null;
+      return world ? [[bone.id, [...world.matrix] as Matrix]] : [];
+    }));
+  }
+  function updateSetupBoneScaleWithoutScalingChildren(
+    id: string,
+    transform: BonePoseTransform,
+    startParentMatrix: Matrix | null = boneWorlds[id]?.matrix ?? null,
+    startChildMatrices: Record<string, Matrix> = directChildWorldMatrices(id),
+    preview = true,
+    record = true,
+  ) {
+    const before = record ? captureDocument() : null;
+    let nextSetup = { ...setupBoneTransforms, [id]: { ...transform } };
+
+    if (startParentMatrix) {
+      const provisionalTransforms = Object.fromEntries(bones.map((bone) => [
+        bone.id,
+        composeBoneTransform(nextSetup[bone.id] ?? identityBoneTransform(), currentBoneTransform(bone.id)),
+      ]));
+      const provisionalWorlds = boneWorldMap(bones, provisionalTransforms);
+      const nextParent = provisionalWorlds[id];
+      if (nextParent) {
+        for (const [childId, startChildMatrix] of Object.entries(startChildMatrices)) {
+          const child = bones.find((bone) => bone.id === childId);
+          if (!child || child.parentId !== id) continue;
+
+          // The joint follows its scaled parent, while the child's world-space
+          // basis stays unchanged. This prevents Setup fitting from stretching
+          // or rotating the child chain; Pose mode intentionally keeps normal
+          // inherited scaling.
+          const desiredChildWorld = childWorldMatrixWithoutInheritedScale(startParentMatrix, nextParent.matrix, startChildMatrix);
+          const desiredChildLocal = multiplyMatrix(invertMatrix(nextParent.matrix), desiredChildWorld);
+          const effectiveChild = boneTransformFromLocalMatrix(child, desiredChildLocal);
+          nextSetup[childId] = relativeBoneTransform(effectiveChild, currentBoneTransform(childId));
+        }
+      }
+    }
+
+    setupBoneTransforms = nextSetup;
+    applyAllTransforms(); dirty = true;
+    if (preview) schedulePreview();
+    schedulePersist();
+    if (before) commitHistory("Scale rig setup", before);
+  }
   function updateBonePose(id: string, transform: BonePoseTransform, preview = true, record = true) {
     if (!activePose) return;
     const before = record ? captureDocument() : null;
@@ -1122,10 +1362,32 @@
     if (rigEditMode === "setup") updateSetupBoneTransform(selectedBone.id, { ...currentSetupBoneTransform(selectedBone.id), rotation });
     else updateBonePose(selectedBone.id, { ...currentBoneTransform(selectedBone.id), rotation });
   }
-  function resetBoneRotation() {
+  function resetSelectedBoneToRest() {
     if (!selectedBone) return;
-    if (rigEditMode === "setup") updateSetupBoneTransform(selectedBone.id, identityBoneTransform());
-    else if (activePose) updateBonePose(selectedBone.id, identityBoneTransform());
+    if (rigEditMode === "pose" && !activePose) return;
+    const before = captureDocument();
+    const boneId = selectedBone.id;
+    const boneName = selectedBone.name;
+    const poseId = activePose?.id;
+    const poseName = activePose?.name;
+    if (rigEditMode === "setup") {
+      const next = { ...setupBoneTransforms };
+      delete next[boneId];
+      setupBoneTransforms = next;
+    } else if (activePose) {
+      poses = poses.map((pose) => {
+        if (pose.id !== poseId) return pose;
+        const boneTransforms = { ...(pose.boneTransforms ?? {}) };
+        delete boneTransforms[boneId];
+        return { ...pose, boneTransforms };
+      });
+    }
+    applyAllTransforms();
+    commitHistory(`Reset ${boneName} to Rest`, before);
+    dirty = true;
+    schedulePreview();
+    schedulePersist();
+    status = `${boneName} restored to ${rigEditMode === "setup" ? "base rig placement" : `Rest in ${poseName}`}`;
   }
   function changeBonePoseNumber(field: keyof BonePoseTransform, event: Event) {
     if (!selectedBone || (rigEditMode === "pose" && !activePose)) return;
@@ -1133,7 +1395,8 @@
     if (!Number.isFinite(value)) return;
     const current = rigEditMode === "setup" ? currentSetupBoneTransform(selectedBone.id) : currentBoneTransform(selectedBone.id);
     const next = { ...current, [field]: field.startsWith("scale") ? Math.max(0.02, value) : value };
-    if (rigEditMode === "setup") updateSetupBoneTransform(selectedBone.id, next);
+    if (rigEditMode === "setup" && field.startsWith("scale")) updateSetupBoneScaleWithoutScalingChildren(selectedBone.id, next);
+    else if (rigEditMode === "setup") updateSetupBoneTransform(selectedBone.id, next);
     else updateBonePose(selectedBone.id, next);
   }
   function pointWithMatrix(matrix: Matrix, x: number, y: number) {
@@ -1170,7 +1433,16 @@
       scaleX,
       scaleY,
     };
-    if (rigEditMode === "setup") updateSetupBoneTransform(state.boneId, relativeBoneTransform(effective, state.startPose), false, false);
+    if (rigEditMode === "setup" && state.gesture.startsWith("scale")) {
+      updateSetupBoneScaleWithoutScalingChildren(
+        state.boneId,
+        relativeBoneTransform(effective, state.startPose),
+        state.startMatrix,
+        state.startChildMatrices,
+        false,
+        false,
+      );
+    } else if (rigEditMode === "setup") updateSetupBoneTransform(state.boneId, relativeBoneTransform(effective, state.startPose), false, false);
     else updateBonePose(state.boneId, relativeBoneTransform(effective, state.startSetup), false, false);
   }
   function bonePointerDown(event: PointerEvent, boneId: string, gesture: BoneGesture) {
@@ -1196,7 +1468,9 @@
       startPose: { ...currentBoneTransform(boneId) },
       startEffective: { ...effectiveBoneTransform(boneId) },
       parentInverse: parentMatrix ? invertMatrix(parentMatrix) : [1, 0, 0, 1, 0, 0],
+      startMatrix: [...world.matrix] as Matrix,
       startWorld: { startX: world.startX, startY: world.startY, endX: world.endX, endY: world.endY },
+      startChildMatrices: directChildWorldMatrices(boneId),
       historyBefore: captureDocument(),
     };
     rigSvg?.setPointerCapture(event.pointerId);
@@ -1254,12 +1528,16 @@
     if (!boneDrag || boneDrag.pointerId !== event.pointerId) return;
     const completed = boneDrag;
     const before = completed.historyBefore;
-    const autoBoundGroup = completed.gesture === "move" && completed.didMove ? autoBindMovedBone(completed.boneId) : null;
+    const autoBinding = completed.gesture === "move" && completed.didMove ? autoBindMovedBone(completed.boneId) : null;
     boneDrag = null;
-    commitHistory(autoBoundGroup ? "Move, bind, and fit bone" : "Transform bone", before);
+    commitHistory(autoBinding ? autoBinding.fitted ? "Move, bind, and fit bone" : "Move and bind bone" : "Transform bone", before);
     schedulePreview();
-    status = autoBoundGroup
-      ? `Auto-bound and fitted to ${autoBoundGroup}`
+    status = autoBinding
+      ? autoBinding.fitted
+        ? `Auto-bound and fitted to ${autoBinding.label}`
+        : autoBinding.multi
+          ? `Auto-bound to ${autoBinding.label} · multi-bone Pose deformation enabled`
+          : `Auto-bound to ${autoBinding.label} · fit unavailable, moved placement kept`
       : rigEditMode === "setup" ? "Guide placement updated; artwork remains frozen" : `${activePose?.name ?? "Pose"} rig transform updated`;
   }
   function pointerDown(event: PointerEvent) {
@@ -1409,10 +1687,19 @@
     if (shortcut && !event.altKey && shortcutKey === "y") {
       event.preventDefault(); redo(); return;
     }
+    if (event.key === "Escape" && isPlaying) {
+      event.preventDefault(); stopPlayback(); status = onionSkin ? "Pose playback stopped · onion skin resumed" : "Pose playback stopped"; return;
+    }
     if (event.key === "Escape" && modalTool) {
       event.preventDefault(); exitModalTransform(true); return;
     }
+    if (event.key === "Escape") {
+      event.preventDefault(); clearEditorSelection(); return;
+    }
     if ((event.target as HTMLElement | null)?.matches("input,select,textarea")) return;
+    if (event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey && !isPlaying) {
+      event.preventDefault(); togglePlayback(); return;
+    }
     const key = event.key.toLowerCase();
     if (key === "v") { selectEditorTool("move"); return; }
     if (key === "g") { event.preventDefault(); enterModalTransform("move"); return; }
@@ -1434,13 +1721,17 @@
       if (event.key === "ArrowDown") nudgeSelectedBone(0, amount);
       event.preventDefault(); return;
     }
-    if (!selectedGroupKey || !activePose) return;
-    const transform = { ...currentTransform(selectedGroupKey) };
-    if (event.key === "ArrowLeft") transform.x -= amount;
-    if (event.key === "ArrowRight") transform.x += amount;
-    if (event.key === "ArrowUp") transform.y -= amount;
-    if (event.key === "ArrowDown") transform.y += amount;
-    updateTransform(selectedGroupKey, transform); event.preventDefault();
+    if (viewMode === "vector" && selectedGroupKey && activePose) {
+      const transform = { ...currentTransform(selectedGroupKey) };
+      if (event.key === "ArrowLeft") transform.x -= amount;
+      if (event.key === "ArrowRight") transform.x += amount;
+      if (event.key === "ArrowUp") transform.y -= amount;
+      if (event.key === "ArrowDown") transform.y += amount;
+      updateTransform(selectedGroupKey, transform); event.preventDefault(); return;
+    }
+    if (!selectedBoneId && !selectedGroupKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      event.preventDefault(); stepPoseView(event.key === "ArrowLeft" ? -1 : 1);
+    }
   }
   function schedulePreview() {
     previewRevision += 1;
@@ -1469,6 +1760,20 @@
       aiPreviewBusy = false;
     }
   }
+  async function renderRefinedPixelPng(svg: string, width: number, height: number): Promise<Uint8Array> {
+    const refined = await invoke<number[]>("render_pixel_png", {
+      svg,
+      paletteSvg: sourceSvg,
+      width,
+      height,
+      resizeMode,
+      paletteSize: Math.round(aiPaletteSize),
+      contourStrength: Math.round(pixelContourStrength),
+      preserveDetails: Math.round(pixelDetailFloor),
+      coverageThreshold: Math.round(pixelCoverageThreshold),
+    });
+    return new Uint8Array(refined);
+  }
   async function refreshPreviewFrame(revision: number) {
     const width = Math.max(1, Math.round(outputWidth));
     const height = Math.max(1, Math.round(outputHeight));
@@ -1476,31 +1781,59 @@
     const useRasterizer = aiPixelFilter && isTauri();
     const paletteSize = Math.round(aiPaletteSize);
     const previewOptions = { antiAlias, resizeMode };
+    let neighbors = onionSkin && !isPlaying ? wrappedPoseNeighbors(poses, activePoseId) : null;
+    let previousSvg: string | null = null;
+    let nextSvg: string | null = null;
+    try {
+      if (neighbors) {
+        previousSvg = serializePoseFrame(neighbors.previous);
+        nextSvg = serializePoseFrame(neighbors.next);
+        restoreActivePoseHost();
+      }
+    } catch (error) {
+      console.warn("Unable to prepare onion-skin frames", error);
+      neighbors = null;
+      previousSvg = null;
+      nextSvg = null;
+      restoreActivePoseHost();
+    }
     try {
       if (useRasterizer) {
         aiPreviewBusy = true;
         canvasBackend = `Pixel rasterizer · resolving ${paletteSize} colors`;
-        const refined = await invoke<number[]>("render_pixel_png", {
-          svg,
-          paletteSvg: sourceSvg,
-          width,
-          height,
-          resizeMode,
-          paletteSize,
-          contourStrength: Math.round(pixelContourStrength),
-          preserveDetails: Math.round(pixelDetailFloor),
-        });
+        const refined = await renderRefinedPixelPng(svg, width, height);
         if (revision !== previewRevision) return;
-        await renderEncodedPixelPreview(new Uint8Array(refined), previewCanvas, width, height);
+        await renderEncodedPixelPreview(refined, previewCanvas, width, height);
         if (revision !== previewRevision) return;
-        canvasBackend = `Pixel rasterizer · ${paletteSize} locked colors`;
+        if (previousSvg && nextSvg) {
+          const [previousPng, nextPng] = await Promise.all([
+            renderRefinedPixelPng(previousSvg, width, height),
+            renderRefinedPixelPng(nextSvg, width, height),
+          ]);
+          if (revision !== previewRevision) return;
+          const [previousFrame, nextFrame] = await Promise.all([
+            encodedPngToCanvas(previousPng, width, height),
+            encodedPngToCanvas(nextPng, width, height),
+          ]);
+          if (revision !== previewRevision) return;
+          overlayOnionSkins(previewCanvas, width, height, previousFrame, nextFrame);
+        }
+        canvasBackend = `Pixel rasterizer · ${paletteSize} locked colors${neighbors ? " · Onion skin" : ""}`;
         aiPreviewBusy = false;
         return;
       }
       aiPreviewBusy = false;
       const backend = await renderPixelPreview(svg, width, height, previewCanvas, previewOptions);
       if (revision !== previewRevision) return;
-      canvasBackend = backend === "canvaskit" ? "CanvasKit · Skia/WASM" : "Canvas 2D fallback";
+      if (previousSvg && nextSvg) {
+        const [previousFrame, nextFrame] = await Promise.all([
+          rasterizeSvg(previousSvg, width, height, previewOptions),
+          rasterizeSvg(nextSvg, width, height, previewOptions),
+        ]);
+        if (revision !== previewRevision) return;
+        overlayOnionSkins(previewCanvas, width, height, previousFrame, nextFrame);
+      }
+      canvasBackend = `${backend === "canvaskit" ? "CanvasKit · Skia/WASM" : "Canvas 2D fallback"}${neighbors ? " · Onion skin" : ""}`;
     } catch (error) {
       console.error(error);
       if (revision !== previewRevision) return;
@@ -1511,7 +1844,7 @@
   }
   function schedulePersist() {
     if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, preferredRigEditMode, aiPixelFilter, aiPaletteSize, pixelContourStrength, pixelDetailFloor, primaryView: viewMode, pixelVisible, playbackFps, zoom, canvasPan } satisfies Session)), 250);
+    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, preferredRigEditMode, aiPixelFilter, aiPaletteSize, pixelContourStrength, pixelDetailFloor, pixelCoverageThreshold, primaryView: viewMode, pixelVisible, playbackFps, onionSkin, zoom, canvasPan } satisfies Session)), 250);
   }
   async function exportPngInBrowser(svg: string, name: string) {
     try {
@@ -1522,25 +1855,40 @@
   }
   async function exportPng() {
     if (!sourceSvg) return;
-    const svg = serializeForExport(svgHost), base = fileName.replace(/\.svg$/i, "");
+    const svg = serializePoseFrame(activePose), base = fileName.replace(/\.svg$/i, "");
+    applyAllTransforms();
     const poseName = (activePose?.name ?? "rest").replace(/[^a-z0-9_-]+/gi, "-").toLowerCase();
     const defaultName = `${base}-${poseName}-${outputWidth}x${outputHeight}.png`;
     try {
       if (isTauri()) {
         const path = await save({ defaultPath: defaultName, filters: [{ name: "Portable Network Graphics", extensions: ["png"] }] });
         if (!path) return;
-        await invoke("export_png", { svg, paletteSvg: sourceSvg, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, pixelArt: aiPixelFilter, paletteSize: Math.round(aiPaletteSize), contourStrength: Math.round(pixelContourStrength), preserveDetails: Math.round(pixelDetailFloor) });
+        await invoke("export_png", { svg, paletteSvg: sourceSvg, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, pixelArt: aiPixelFilter, paletteSize: Math.round(aiPaletteSize), contourStrength: Math.round(pixelContourStrength), preserveDetails: Math.round(pixelDetailFloor), coverageThreshold: Math.round(pixelCoverageThreshold) });
         status = `Exported ${path.split(/[\\/]/).pop()}`;
       } else { await exportPngInBrowser(svg, defaultName); status = `Exported ${defaultName}`; }
     } catch (error) { status = error instanceof Error ? error.message : String(error); }
   }
-  function serializePoseFrame(pose: Pose | null): string {
-    const matrices = calculatedGroupMatricesFor(pose);
+  function applyPoseFrameToHost(pose: Pose | null, deformFromRig = true, matrixOverrides?: Record<string, Matrix>) {
+    const matrices = matrixOverrides ?? calculatedGroupMatricesFor(pose);
     for (const group of groups) {
       setWrapperMatrix(svgHost, group.key, matrices[group.key]);
       setWrapperVisibility(svgHost, group.key, groupIsVisible(group.key, pose));
     }
-    applyShapePaths(svgHost, pose?.shapePaths ?? {});
+    applyPoseShapePaths(pose, deformFromRig);
+  }
+  function restoreActivePoseHost() {
+    const calculated = calculatedGroupMatrices();
+    const freezeRig = viewMode === "rig" && rigEditMode === "setup" && !isPlaying;
+    const matrices = Object.fromEntries(groups.map((group) => [
+      group.key,
+      freezeRig && setupFrozenMatrices[group.key] ? setupFrozenMatrices[group.key] : calculated[group.key],
+    ]));
+    applyPoseFrameToHost(activePose, rigEditMode === "pose" || isPlaying, matrices);
+    selectWrapper(svgHost, selectedGroupKey);
+    highlightBoneWrapper(svgHost, selectedBone?.groupKey ?? null);
+  }
+  function serializePoseFrame(pose: Pose | null): string {
+    applyPoseFrameToHost(pose, true);
     return serializeForExport(svgHost);
   }
   function serializeAllFrames(): string[] {
@@ -1572,7 +1920,7 @@
       if (isTauri()) {
         const path = await save({ defaultPath: defaultName, filters: [{ name: "Horizontal PNG Tileset", extensions: ["png"] }] });
         if (!path) return;
-        await invoke("export_tileset", { svgs, paletteSvg: sourceSvg, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, pixelArt: aiPixelFilter, paletteSize: Math.round(aiPaletteSize), contourStrength: Math.round(pixelContourStrength), preserveDetails: Math.round(pixelDetailFloor) });
+        await invoke("export_tileset", { svgs, paletteSvg: sourceSvg, path, width: Math.round(outputWidth), height: Math.round(outputHeight), antiAlias: Math.round(antiAlias), resizeMode, pixelArt: aiPixelFilter, paletteSize: Math.round(aiPaletteSize), contourStrength: Math.round(pixelContourStrength), preserveDetails: Math.round(pixelDetailFloor), coverageThreshold: Math.round(pixelCoverageThreshold) });
         status = `Exported ${svgs.length}-frame tileset`;
       } else {
         await exportTilesetInBrowser(svgs, defaultName);
@@ -1615,7 +1963,7 @@
           <div class="empty-panel"><span class="empty-glyph">◇</span><strong>No vector loaded</strong><p>Open an SVG with groups to begin building poses.</p><button class="text-button" onclick={openSvg}>Choose SVG →</button></div>
         {/if}
       {:else}
-        <div class="rig-tools"><button disabled={!sourceSvg || rigEditMode !== "setup"} onclick={addBone}>＋ ADD {selectedBone ? "CHILD" : "ROOT"} BONE</button><small>{rigEditMode === "setup" ? (selectedGroup ? `AUTO-BIND: ${selectedGroup.label}` : "SELECT A GROUP TO AUTO-BIND") : "SWITCH TO SETUP TO EDIT THE RIG"}</small></div>
+        <div class="rig-tools"><button disabled={!sourceSvg || rigEditMode !== "setup"} onclick={addBone}>＋ ADD {selectedBone ? "CHILD" : "ROOT"} BONE</button><small>{rigEditMode === "setup" ? (selectedBone ? "CHAIN: 50% COVER → NEXT UNRIGGED SHAPE" : selectedGroup ? `AUTO-BIND: ${selectedGroup.label}` : "SELECT A GROUP TO AUTO-BIND") : "SWITCH TO SETUP TO EDIT THE RIG"}</small></div>
         {#if bones.length}
           <div class="group-list bone-list">
             {#each bones as bone}
@@ -1647,7 +1995,7 @@
       </div>
       <div class="stage" class:split-view={pixelVisible && viewMode !== null} class:pixel-only={pixelVisible && viewMode === null}>
         <div class="stage-grid"></div><div class="axis horizontal"></div><div class="axis vertical"></div>
-        <div bind:this={primaryViewport} class="viewport-pane primary-viewport" class:pane-suppressed={viewMode === null} class:panning={Boolean(panDrag)} class:modal-transform={Boolean(modalTool)} class:modal-move={modalTool === "move"} class:modal-rotate={modalTool === "rotate"} class:modal-scale={modalTool === "scale"} role="application" aria-label="Canvas navigation surface" onwheel={canvasWheel} onpointerdown={viewportPointerDown} onpointermove={viewportPointerMove} onpointerup={viewportPointerUp} onpointercancel={viewportPointerUp} onauxclick={(event) => event.preventDefault()}>
+        <div bind:this={primaryViewport} class="viewport-pane primary-viewport" class:pane-suppressed={viewMode === null} class:panning={Boolean(panDrag)} class:mode-cursor={Boolean(canvasTransformMode)} class:modal-transform={Boolean(modalTool)} class:modal-move={modalTool === "move"} class:modal-rotate={modalTool === "rotate"} class:modal-scale={modalTool === "scale"} style={`--canvas-tool-cursor:${canvasToolCursor}`} role="application" aria-label="Canvas navigation surface" onwheel={canvasWheel} onpointerdown={viewportPointerDown} onpointermove={viewportPointerMove} onpointerup={viewportPointerUp} onpointercancel={viewportPointerUp} onauxclick={(event) => event.preventDefault()}>
           <div class="pane-label"><span>{viewMode === "rig" ? "RIG" : "VECTOR"}</span><small>LIVE WORKSPACE</small></div>
           <div class="canvas-nav-hint"><span>↕</span> SCROLL · ZOOM <i></i><span>●</span> MIDDLE DRAG · PAN <i></i><span>G R S</span> MODAL TRANSFORM {#if viewMode === "rig"}<i></i><span>⌨</span> ARROWS · 1 PX{/if}</div>
           <nav class="tool-rail" aria-label="Transform tools">
@@ -1713,7 +2061,10 @@
         </div>
         <div class="viewport-pane pixel-viewport" class:pane-suppressed={!pixelVisible}>
           <div class="pane-label pixel-label"><span>PIXEL</span><small>{aiPreviewBusy ? "RASTERIZER · RESOLVING…" : aiPixelFilter ? `LOCKED · ${aiPaletteSize}C` : "EXACT PREVIEW"}</small></div>
-          <div class="pixel-preview" style={`aspect-ratio:${outputWidth}/${outputHeight}`}><canvas bind:this={previewCanvas} aria-label="Pixel-art preview"></canvas><div class:processing={aiPreviewBusy} class="pixel-badge">{aiPreviewBusy ? "RESOLVING PIXELS…" : aiPixelFilter ? `CATEGORICAL ${aiPaletteSize}C` : antiAlias === 0 ? "HARD ALPHA" : `EDGE AA ${antiAlias}%`} · {resizeMode === "contain" ? "FIT CENTER" : "STRETCH"}</div></div>
+          <div class="pixel-preview-stack">
+            <div class="pixel-preview" style={`aspect-ratio:${outputWidth}/${outputHeight}`}><canvas bind:this={previewCanvas} aria-label="Pixel-art preview"></canvas></div>
+            <div class:processing={aiPreviewBusy} class="pixel-badge">{aiPreviewBusy ? "RESOLVING PIXELS…" : aiPixelFilter ? `CATEGORICAL ${aiPaletteSize}C · COVER ${pixelCoverageThreshold}%` : antiAlias === 0 ? "HARD ALPHA" : `EDGE AA ${antiAlias}%`} · {resizeMode === "contain" ? "FIT CENTER" : "STRETCH"}</div>
+          </div>
         </div>
         {#if !sourceSvg}<button class="drop-target" onclick={openSvg}><span class="drop-icon">＋</span><strong>LOAD YOUR VECTOR</strong><p>SVG groups become poseable layers.</p><small>OPEN .SVG</small></button>{/if}
       </div>
@@ -1721,7 +2072,7 @@
     </section>
 
     <aside class="panel inspector-panel">
-      <div class="panel-heading"><div><span class="eyebrow">SELECTION</span><h2>{viewMode === "rig" ? "Bone" : "Transform"}</h2></div>{#if viewMode === "rig"}<button class="reset" disabled={!selectedBone || (rigEditMode === "pose" && !activePose)} onclick={resetBoneRotation}>{rigEditMode === "setup" ? "RESET PLACEMENT" : "ZERO POSE"}</button>{:else}<button class="reset" disabled={!canEdit || !selectedGroupKey} onclick={resetSelected}>RESET</button>{/if}</div>
+      <div class="panel-heading"><div><span class="eyebrow">SELECTION</span><h2>{viewMode === "rig" ? "Bone" : "Transform"}</h2></div>{#if viewMode === "rig"}<button class="reset rest-reset" disabled={!selectedBone || (rigEditMode === "pose" && !activePose)} title="Restore the selected bone to its default Rest transform" onclick={resetSelectedBoneToRest}><span>↶</span> RESET TO REST</button>{:else}<button class="reset rest-reset" disabled={!canEdit || !selectedGroupKey} title="Clear this group's pose transform, visibility, and shape overrides" onclick={resetSelectedGroupToRest}><span>↶</span> RESET TO REST</button>{/if}</div>
       {#if viewMode === "rig" && selectedBone}
         <div class="selection-card"><span class="selection-chip bone-chip">B</span><div><small>ACTIVE BONE · {rigEditMode === "setup" ? "SETUP" : "POSE"}</small><strong>{selectedBone.name}</strong></div></div>
         <div class:follow={rigEditMode === "pose"} class="rig-behavior-note"><span>{rigEditMode === "setup" ? "01" : "02"}</span><div><strong>{rigEditMode === "setup" ? "Artwork frozen · guides live" : "Artwork follows the same guides"}</strong><small>{rigEditMode === "setup" ? "Arrange the guide placement freely. Switching to Pose keeps every bone exactly where you put it." : "The guide does not jump when modes change; bound groups now follow its current placement."}</small></div></div>
@@ -1773,8 +2124,9 @@
           <div class="rasterizer-method"><span>ADAPTIVE SS</span><i></i><span>NO BLEND</span><i></i><span>POSE LOCK</span></div>
           <div class="ai-palette" class:disabled={!aiPixelFilter}><div class="option-copy"><span>LOCKED SVG PALETTE</span><strong>{aiPaletteSize} COLORS</strong></div><input aria-label="Locked SVG palette colors" disabled={!aiPixelFilter} type="range" min="2" max="64" step="1" bind:value={aiPaletteSize} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
           <div class="ai-palette" class:disabled={!aiPixelFilter}><div class="option-copy"><span>CONTOUR CLEANUP</span><strong>{pixelContourStrength < 25 ? "OFF" : pixelContourStrength < 75 ? "DOUBLES" : "STRICT"}</strong></div><input aria-label="Contour cleanup" disabled={!aiPixelFilter} type="range" min="0" max="100" step="1" bind:value={pixelContourStrength} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /></div>
+          <div class="ai-palette coverage-threshold" class:disabled={!aiPixelFilter}><div class="option-copy"><span>EDGE COVERAGE THRESHOLD</span><strong>{pixelCoverageThreshold}% · {pixelCoverageThreshold < 40 ? "PERMISSIVE" : pixelCoverageThreshold < 60 ? "BALANCED" : pixelCoverageThreshold < 75 ? "STRICT" : "VERY STRICT"}</strong></div><input aria-label="Edge coverage threshold" disabled={!aiPixelFilter} type="range" min="10" max="90" step="1" bind:value={pixelCoverageThreshold} oninput={() => { dirty = true; schedulePreview(); schedulePersist(); }} /><div class="threshold-scale"><span>KEEP THIN DETAILS</span><i></i><span>TIGHTEN SILHOUETTE</span></div></div>
           <label class="select-control raster-detail" class:disabled={!aiPixelFilter}><span>▪</span><select aria-label="Minimum pixel cluster" disabled={!aiPixelFilter} bind:value={pixelDetailFloor} onchange={() => { dirty = true; schedulePreview(); schedulePersist(); }}><option value={1}>KEEP 1 PX DETAILS</option><option value={2}>REMOVE 1 PX NOISE</option><option value={3}>MINIMUM 3 PX CLUSTER</option><option value={4}>MINIMUM 4 PX CLUSTER</option></select></label>
-          <p>Each output pixel chooses one original SVG color. Contours remove doubles and L-corners; every pose shares the same palette and grid.</p>
+          <p>Coverage decides how much vector source must cross a pixel before it becomes solid. Raise it to remove weak edge touches; lower it to preserve thin features.</p>
         </div>
         <button class="export-wide" disabled={!sourceSvg} onclick={exportPng}>EXPORT ACTIVE POSE <span>↓</span></button>
         <button class="export-wide secondary" disabled={!sourceSvg || poses.length === 0} onclick={exportTileset}>EXPORT {poses.length} POSE{poses.length === 1 ? "" : "S"} <span>▦</span></button>
@@ -1791,6 +2143,7 @@
     </div>
     <div class="pose-actions">
       <div class="playback-control"><button class:playing={isPlaying} disabled={!sourceSvg || poses.length === 0} onclick={togglePlayback}><span>{isPlaying ? "■" : "▶"}</span>{isPlaying ? "STOP" : "PLAY POSES"}</button><select aria-label="Playback speed" value={playbackFps} onchange={changePlaybackFps}><option value="1">1 FPS</option><option value="2">2 FPS</option><option value="4">4 FPS</option><option value="8">8 FPS</option></select></div>
+      <button class:active={onionSkin} class:paused={onionSkin && isPlaying} class="onion-skin-toggle" disabled={!sourceSvg || poses.length < 2} aria-pressed={onionSkin} onclick={toggleOnionSkin} title="Show previous pose in red and next pose in blue on the pixel canvas"><span class="onion-colors"><i></i><i></i></span><strong>ONION SKIN</strong><small>{onionSkin && isPlaying ? "PAUSED DURING PLAY" : "PREV 40% · NEXT 40%"}</small><b>{onionSkin ? "ON" : "OFF"}</b></button>
       <small class="frame-readout">{poses.length} POSE{poses.length === 1 ? "" : "S"} · {frameCount} EXPORT FRAME{frameCount === 1 ? "" : "S"}</small>
       {#if activePose}<input aria-label="Pose name" value={activePose.name} onchange={renamePose} /><button onclick={duplicatePose}>DUPLICATE</button>{:else}<span>REST PREVIEW · NOT EXPORTED</span>{/if}
     </div>

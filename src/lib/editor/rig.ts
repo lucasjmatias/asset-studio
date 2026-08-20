@@ -26,6 +26,14 @@ export type GroupFitBounds = {
   localToRoot: Matrix;
 };
 
+export type RigGroupTarget = {
+  key: string;
+  centerX: number;
+  centerY: number;
+  diameter: number;
+  order: number;
+};
+
 export const IDENTITY_MATRIX: Matrix = [1, 0, 0, 1, 0, 0];
 
 export function dominantSampleOwner(
@@ -46,6 +54,33 @@ export function dominantSampleOwner(
   return coverage >= minimumCoverage ? { key: winner.key, coverage } : null;
 }
 
+/**
+ * Continues a child chain into the nearest unrigged group once the current
+ * bone already covers at least half of its group's visual diameter.
+ */
+export function childBoneTargetGroup(
+  currentGroupKey: string | null,
+  parent: BoneEndpoints,
+  targets: RigGroupTarget[],
+  occupiedGroupKeys: Set<string>,
+  coverageThreshold = 0.5,
+): string | null {
+  if (!currentGroupKey) return null;
+  const current = targets.find((target) => target.key === currentGroupKey);
+  if (!current || current.diameter <= 1e-6) return currentGroupKey;
+  const boneLength = Math.hypot(parent.endX - parent.startX, parent.endY - parent.startY);
+  if (boneLength < current.diameter * coverageThreshold) return currentGroupKey;
+
+  const available = targets
+    .filter((target) => target.key !== currentGroupKey && !occupiedGroupKeys.has(target.key))
+    .map((target) => ({
+      target,
+      edgeDistance: Math.max(0, Math.hypot(target.centerX - parent.endX, target.centerY - parent.endY) - target.diameter / 2),
+    }))
+    .sort((left, right) => left.edgeDistance - right.edgeDistance || left.target.order - right.target.order);
+  return available[0]?.target.key ?? currentGroupKey;
+}
+
 export function translateBoneEndpoints(
   endpoints: BoneEndpoints,
   delta: { x: number; y: number },
@@ -53,6 +88,21 @@ export function translateBoneEndpoints(
   return {
     start: { x: endpoints.startX + delta.x, y: endpoints.startY + delta.y },
     end: { x: endpoints.endX + delta.x, y: endpoints.endY + delta.y },
+  };
+}
+
+/** Ensures the large/start joint is the endpoint nearest a parent tip. */
+export function orientBoneStartToward(
+  endpoints: BoneEndpoints,
+  target: { x: number; y: number },
+): BoneEndpoints {
+  const startDistance = Math.hypot(endpoints.startX - target.x, endpoints.startY - target.y);
+  const endDistance = Math.hypot(endpoints.endX - target.x, endpoints.endY - target.y);
+  return startDistance <= endDistance ? endpoints : {
+    startX: endpoints.endX,
+    startY: endpoints.endY,
+    endX: endpoints.startX,
+    endY: endpoints.startY,
   };
 }
 
@@ -128,6 +178,34 @@ export function invertMatrix(matrix: Matrix): Matrix {
     (matrix[2] * matrix[5] - matrix[3] * matrix[4]) / determinant,
     (matrix[1] * matrix[4] - matrix[0] * matrix[5]) / determinant,
   ];
+}
+
+/** Decomposes a bone-local affine matrix into the transform model used by the editor. */
+export function boneTransformFromLocalMatrix(bone: Bone, matrix: Matrix): BonePoseTransform {
+  const scaleX = Math.max(0.02, Math.hypot(matrix[0], matrix[1]));
+  const determinant = matrix[0] * matrix[3] - matrix[1] * matrix[2];
+  return {
+    x: matrix[4] - bone.x,
+    y: matrix[5] - bone.y,
+    rotation: Math.atan2(matrix[1], matrix[0]) * 180 / Math.PI - bone.restRotation,
+    scaleX,
+    scaleY: Math.max(0.02, Math.abs(determinant) / scaleX),
+  };
+}
+
+/**
+ * Moves a child joint with its newly scaled parent while preserving the
+ * child's previous world-space angle and size.
+ */
+export function childWorldMatrixWithoutInheritedScale(
+  startParent: Matrix,
+  nextParent: Matrix,
+  startChild: Matrix,
+): Matrix {
+  const childInStartParent = multiplyMatrix(invertMatrix(startParent), startChild);
+  const nextAnchorX = nextParent[0] * childInStartParent[4] + nextParent[2] * childInStartParent[5] + nextParent[4];
+  const nextAnchorY = nextParent[1] * childInStartParent[4] + nextParent[3] * childInStartParent[5] + nextParent[5];
+  return [startChild[0], startChild[1], startChild[2], startChild[3], nextAnchorX, nextAnchorY];
 }
 
 /**

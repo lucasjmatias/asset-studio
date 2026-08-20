@@ -26,10 +26,12 @@ export type AstdProjectState = {
   aiPaletteSize: number;
   pixelContourStrength: number;
   pixelDetailFloor: number;
+  pixelCoverageThreshold: number;
   preferredRigEditMode: "setup" | "pose";
   primaryView: "vector" | "rig" | null;
   pixelVisible: boolean;
   playbackFps: number;
+  onionSkin: boolean;
   zoom: number;
 };
 
@@ -94,10 +96,12 @@ export function decodeAstdProject(contents: string): AstdProject {
     aiPaletteSize: Math.max(2, Math.min(64, Math.round(finiteNumber(raw.aiPaletteSize, 16)))),
     pixelContourStrength: Math.max(0, Math.min(100, Math.round(finiteNumber(raw.pixelContourStrength, 60)))),
     pixelDetailFloor: Math.max(1, Math.min(4, Math.round(finiteNumber(raw.pixelDetailFloor, 2)))),
+    pixelCoverageThreshold: Math.max(10, Math.min(90, Math.round(finiteNumber(raw.pixelCoverageThreshold, 55)))),
     preferredRigEditMode: raw.preferredRigEditMode === "pose" ? "pose" : "setup",
     primaryView: raw.primaryView === "rig" || raw.primaryView === null ? raw.primaryView : "vector",
     pixelVisible: raw.pixelVisible === true,
     playbackFps: [1, 2, 4, 8].includes(finiteNumber(raw.playbackFps, 2)) ? finiteNumber(raw.playbackFps, 2) : 2,
+    onionSkin: raw.onionSkin === true,
     zoom: Math.max(0.25, Math.min(4, finiteNumber(raw.zoom, 1))),
   };
   return {

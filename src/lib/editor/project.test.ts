@@ -22,10 +22,12 @@ function fixture(): AstdProjectState {
     aiPaletteSize: 12,
     pixelContourStrength: 60,
     pixelDetailFloor: 2,
+    pixelCoverageThreshold: 55,
     preferredRigEditMode: "pose",
     primaryView: "rig",
     pixelVisible: true,
     playbackFps: 4,
+    onionSkin: true,
     zoom: 1.2,
   };
 }

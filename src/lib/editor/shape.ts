@@ -24,6 +24,12 @@ export type ControlGuide = {
 
 type Point = { x: number; y: number };
 
+export type PathBoneInfluence = {
+  start: Point;
+  end: Point;
+  matrix: [number, number, number, number, number, number];
+};
+
 const parameterCount: Record<string, number> = {
   M: 2, L: 2, H: 1, V: 1, C: 6, S: 4, Q: 4, T: 2, A: 7, Z: 0,
 };
@@ -628,4 +634,85 @@ export function pathArea(commands: PathCommand[], curveSteps = 18): number {
   }
   closeSubpath();
   return Math.abs(signedArea);
+}
+
+function distanceToSegment(point: Point, start: Point, end: Point): number {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared < 1e-12) return Math.hypot(point.x - start.x, point.y - start.y);
+  const amount = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
+  return Math.hypot(point.x - start.x - dx * amount, point.y - start.y - dy * amount);
+}
+
+function weightedBonePoint(point: Point, influences: PathBoneInfluence[]): Point {
+  let total = 0;
+  let x = 0;
+  let y = 0;
+  for (const influence of influences) {
+    const boneLength = Math.max(1, Math.hypot(influence.end.x - influence.start.x, influence.end.y - influence.start.y));
+    const normalizedDistance = distanceToSegment(point, influence.start, influence.end) / boneLength;
+    const weight = 1 / (0.08 + normalizedDistance) ** 2;
+    const matrix = influence.matrix;
+    x += (matrix[0] * point.x + matrix[2] * point.y + matrix[4]) * weight;
+    y += (matrix[1] * point.x + matrix[3] * point.y + matrix[5]) * weight;
+    total += weight;
+  }
+  return total > 0 ? { x: x / total, y: y / total } : point;
+}
+
+function coordinateOffsets(command: PathCommand): number[] {
+  if (command.type === "M" || command.type === "L") return [0];
+  if (command.type === "C") return [0, 2, 4];
+  if (command.type === "Q") return [0, 2];
+  if (command.type === "A") return [5];
+  return [];
+}
+
+/**
+ * Pose-only linear skinning for SVG path anchors and pullers. Every point is
+ * blended by proximity to the rest bones, then a uniform correction restores
+ * the exact area the pose had before rig deformation.
+ */
+export function deformPathWithBones(
+  commands: PathCommand[],
+  influences: PathBoneInfluence[],
+  preserveVolume = true,
+): PathCommand[] {
+  if (influences.length < 2) return commands.map((command) => ({ ...command, values: [...command.values] }));
+  const targetArea = pathArea(commands);
+  const next = commands.map((command) => {
+    const values = [...command.values];
+    for (const offset of coordinateOffsets(command)) {
+      const transformed = weightedBonePoint({ x: values[offset], y: values[offset + 1] }, influences);
+      values[offset] = transformed.x;
+      values[offset + 1] = transformed.y;
+    }
+    return { ...command, values };
+  });
+  if (!preserveVolume || targetArea < 1e-8) return next;
+
+  const deformedArea = pathArea(next);
+  if (deformedArea < 1e-8) return next;
+  const anchors = next.flatMap((command) => {
+    if (command.type === "Z") return [];
+    const offset = command.type === "A" ? 5 : command.values.length - 2;
+    return [{ x: command.values[offset], y: command.values[offset + 1] }];
+  });
+  if (anchors.length === 0) return next;
+  const center = anchors.reduce((sum, point) => ({ x: sum.x + point.x, y: sum.y + point.y }), { x: 0, y: 0 });
+  center.x /= anchors.length;
+  center.y /= anchors.length;
+  const volumeScale = Math.sqrt(targetArea / deformedArea);
+  for (const command of next) {
+    for (const offset of coordinateOffsets(command)) {
+      command.values[offset] = center.x + (command.values[offset] - center.x) * volumeScale;
+      command.values[offset + 1] = center.y + (command.values[offset + 1] - center.y) * volumeScale;
+    }
+    if (command.type === "A") {
+      command.values[0] *= volumeScale;
+      command.values[1] *= volumeScale;
+    }
+  }
+  return next;
 }

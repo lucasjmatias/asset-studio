@@ -7,7 +7,7 @@ import {
   type Bone,
   type BonePoseTransform,
 } from "./model";
-import { boneGroupMatrices, boneWorldMap, composeGroupLocalMatrices, dominantSampleOwner, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, translateBoneEndpoints, type Matrix } from "./rig";
+import { boneGroupMatrices, boneTransformFromLocalMatrix, boneWorldMap, childBoneTargetGroup, childWorldMatrixWithoutInheritedScale, composeGroupLocalMatrices, dominantSampleOwner, fitBoneToGroupBounds, invertMatrix, multiplyMatrix, orientBoneStartToward, translateBoneEndpoints, type Matrix } from "./rig";
 
 const bone: Bone = {
   id: "root",
@@ -91,6 +91,11 @@ describe("bone endpoint pivots", () => {
 });
 
 describe("automatic group fitting", () => {
+  it("orients the large start joint toward the parent tip", () => {
+    const oriented = orientBoneStartToward({ startX: 80, startY: 10, endX: 20, endY: 10 }, { x: 18, y: 12 });
+    expect(oriented).toEqual({ startX: 20, startY: 10, endX: 80, endY: 10 });
+  });
+
   it("centres along the longest shape axis and insets both ends", () => {
     const fit = fitBoneToGroupBounds({
       x: 10,
@@ -138,6 +143,29 @@ describe("automatic group fitting", () => {
   });
 });
 
+describe("setup-only scale compensation", () => {
+  it("decomposes a child-local matrix without inheriting parent scale", () => {
+    const child: Bone = { ...bone, id: "child", x: 40, y: 0, restRotation: 0 };
+    const transform = boneTransformFromLocalMatrix(child, [0, 1, -1, 0, 60, 25]);
+    expect(transform.x).toBe(20);
+    expect(transform.y).toBe(25);
+    expect(transform.rotation).toBeCloseTo(90, 8);
+    expect(transform.scaleX).toBeCloseTo(1, 8);
+    expect(transform.scaleY).toBeCloseTo(1, 8);
+  });
+
+  it("moves the child joint with its parent without changing child length or angle", () => {
+    const startParent: Matrix = [1, 0, 0, 1, 10, 20];
+    const nextParent: Matrix = [2, 0, 0, 0.5, 10, 20];
+    const startChild: Matrix = [0, 1, -1, 0, 50, 20];
+    const compensated = childWorldMatrixWithoutInheritedScale(startParent, nextParent, startChild);
+
+    expect(compensated).toEqual([0, 1, -1, 0, 90, 20]);
+    expect(Math.hypot(compensated[0], compensated[1])).toBe(1);
+    expect(Math.atan2(compensated[1], compensated[0]) * 180 / Math.PI).toBe(90);
+  });
+});
+
 describe("automatic group binding", () => {
   it("selects a group only when it owns most bone samples", () => {
     expect(dominantSampleOwner([
@@ -147,6 +175,16 @@ describe("automatic group binding", () => {
 
   it("does not bind when no group reaches the overlap threshold", () => {
     expect(dominantSampleOwner(["hand", "hand", "arm", "arm", null])).toBeNull();
+  });
+
+  it("continues a covered parent into the nearest first-detected unrigged shape", () => {
+    const targets = [
+      { key: "arm", centerX: 0, centerY: 0, diameter: 100, order: 0 },
+      { key: "hand", centerX: 80, centerY: 0, diameter: 30, order: 1 },
+      { key: "finger", centerX: 80, centerY: 0, diameter: 20, order: 2 },
+    ];
+    expect(childBoneTargetGroup("arm", { startX: 0, startY: 0, endX: 60, endY: 0 }, targets, new Set(["arm"]))).toBe("hand");
+    expect(childBoneTargetGroup("arm", { startX: 0, startY: 0, endX: 40, endY: 0 }, targets, new Set(["arm"]))).toBe("arm");
   });
 });
 

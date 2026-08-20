@@ -69,6 +69,71 @@ function renderFallback(source: HTMLCanvasElement, target: HTMLCanvasElement) {
   context.drawImage(source, Math.floor((target.width - width) / 2), Math.floor((target.height - height) / 2), width, height);
 }
 
+export async function encodedPngToCanvas(
+  png: Uint8Array,
+  width: number,
+  height: number,
+): Promise<HTMLCanvasElement> {
+  const bitmap = await createImageBitmap(new Blob([png], { type: "image/png" }));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    bitmap.close();
+    throw new Error("Unable to decode the refined pixel frame.");
+  }
+  context.imageSmoothingEnabled = false;
+  context.drawImage(bitmap, 0, 0, width, height);
+  bitmap.close();
+  return canvas;
+}
+
+function tintedFrame(source: HTMLCanvasElement, color: string): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = source.width;
+  canvas.height = source.height;
+  const context = canvas.getContext("2d");
+  if (!context) return canvas;
+  context.imageSmoothingEnabled = false;
+  context.drawImage(source, 0, 0);
+  context.globalCompositeOperation = "source-in";
+  context.fillStyle = color;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+/** Draw wrapped neighboring poses below the current pixel frame. */
+export function overlayOnionSkins(
+  target: HTMLCanvasElement,
+  pixelWidth: number,
+  pixelHeight: number,
+  previous: HTMLCanvasElement,
+  next: HTMLCanvasElement,
+) {
+  const context = target.getContext("2d");
+  if (!context) return;
+  const current = document.createElement("canvas");
+  current.width = target.width;
+  current.height = target.height;
+  current.getContext("2d")?.drawImage(target, 0, 0);
+  const previousTint = tintedFrame(previous, "#ff3b30");
+  const nextTint = tintedFrame(next, "#1683ff");
+  const scale = Math.max(1, Math.floor(Math.min(target.width / pixelWidth, target.height / pixelHeight)));
+  const width = pixelWidth * scale;
+  const height = pixelHeight * scale;
+  const x = Math.floor((target.width - width) / 2);
+  const y = Math.floor((target.height - height) / 2);
+
+  context.clearRect(0, 0, target.width, target.height);
+  context.imageSmoothingEnabled = false;
+  context.globalAlpha = 0.4;
+  context.drawImage(previousTint, x, y, width, height);
+  context.drawImage(nextTint, x, y, width, height);
+  context.globalAlpha = 1;
+  context.drawImage(current, 0, 0);
+}
+
 export async function renderEncodedPixelPreview(
   png: Uint8Array,
   target: HTMLCanvasElement,
