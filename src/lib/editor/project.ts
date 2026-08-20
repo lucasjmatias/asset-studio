@@ -32,6 +32,8 @@ export type AstdProjectState = {
   pixelVisible: boolean;
   playbackFps: number;
   onionSkin: boolean;
+  onionSkinScope: "all" | "selected";
+  onionSkinRadius: number;
   zoom: number;
 };
 
@@ -102,6 +104,8 @@ export function decodeAstdProject(contents: string): AstdProject {
     pixelVisible: raw.pixelVisible === true,
     playbackFps: [1, 2, 4, 8, 12].includes(finiteNumber(raw.playbackFps, 2)) ? finiteNumber(raw.playbackFps, 2) : 2,
     onionSkin: raw.onionSkin === true,
+    onionSkinScope: raw.onionSkinScope === "selected" ? "selected" : "all",
+    onionSkinRadius: Math.max(1, Math.min(8, Math.round(finiteNumber(raw.onionSkinRadius, 1)))),
     zoom: Math.max(0.25, Math.min(4, finiteNumber(raw.zoom, 1))),
   };
   return {

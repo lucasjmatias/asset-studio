@@ -21,7 +21,7 @@
   type RigEditMode = "setup" | "pose";
   type BoneGesture = "move" | "rotate-start" | "rotate-end" | "scale-start" | "scale-end";
   type PrimaryView = "vector" | "rig";
-  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; preferredRigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; pixelContourStrength?: number; pixelDetailFloor?: number; pixelCoverageThreshold?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; onionSkin?: boolean; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number; zoom?: number; canvasPan?: { x: number; y: number } };
+  type Session = { sourceSvg: string; fileName: string; poses: Pose[]; bones: Bone[]; activePoseId: string; outputWidth: number; outputHeight: number; antiAlias: number; resizeMode: PixelResizeMode; rigEditMode?: RigEditMode; preferredRigEditMode?: RigEditMode; aiPixelFilter?: boolean; aiPaletteSize?: number; pixelContourStrength?: number; pixelDetailFloor?: number; pixelCoverageThreshold?: number; primaryView?: PrimaryView | null; pixelVisible?: boolean; playbackFps?: number; onionSkin?: boolean; onionSkinScope?: "all" | "selected"; onionSkinRadius?: number; setupBoneTransforms?: Record<string, BonePoseTransform>; rigTransformModel?: number; zoom?: number; canvasPan?: { x: number; y: number } };
   type DocumentSnapshot = { poses: Pose[]; bones: Bone[]; setupBoneTransforms: Record<string, BonePoseTransform>; activePoseId: string; selectedGroupKey: string | null; selectedBoneId: string | null };
   type DragState = { pointerId: number; key: string; startPoint: { x: number; y: number }; startTransform: GroupTransform; inverse: DOMMatrix; rootToTool: Matrix; pivot: { x: number; y: number }; startAngle: number; startDistance: number; startDx: number; startDy: number; historyBefore: DocumentSnapshot };
   type BoneDragState = { pointerId: number; boneId: string; gesture: BoneGesture; inverse: DOMMatrix; startPoint: DOMPoint; startBone: Bone; startSetup: BonePoseTransform; startPose: BonePoseTransform; startEffective: BonePoseTransform; parentInverse: Matrix; startMatrix: Matrix; startWorld: { startX: number; startY: number; endX: number; endY: number }; startChildMatrices: Record<string, Matrix>; historyBefore: DocumentSnapshot };
@@ -90,6 +90,8 @@
   let isPlaying = $state(false);
   let playbackFps = $state(2);
   let onionSkin = $state(false);
+  let onionSkinScope = $state<"all" | "selected">("all");
+  let onionSkinRadius = $state(1);
   let playbackTimer: ReturnType<typeof setTimeout> | null = null;
   let drag: DragState | null = null;
   let boneDrag = $state<BoneDragState | null>(null);
@@ -205,6 +207,8 @@
       if (!viewMode && !pixelVisible) viewMode = "vector";
       playbackFps = [1, 2, 4, 8, 12].includes(session.playbackFps || 0) ? session.playbackFps! : 2;
       onionSkin = session.onionSkin === true;
+      onionSkinScope = session.onionSkinScope === "selected" ? "selected" : "all";
+      onionSkinRadius = Math.max(1, Math.min(8, Math.round(session.onionSkinRadius ?? 1)));
       zoom = Math.max(0.25, Math.min(4, session.zoom ?? 1));
       canvasPan = Number.isFinite(session.canvasPan?.x) && Number.isFinite(session.canvasPan?.y)
         ? { x: session.canvasPan!.x, y: session.canvasPan!.y }
@@ -681,6 +685,8 @@
       pixelVisible,
       playbackFps,
       onionSkin,
+      onionSkinScope,
+      onionSkinRadius,
       zoom,
     };
   }
@@ -703,7 +709,7 @@
     viewMode = saved.primaryView; pixelVisible = saved.pixelVisible;
     if (!viewMode && !pixelVisible) viewMode = "vector";
     leftMode = viewMode === "rig" ? "rig" : "groups";
-    playbackFps = saved.playbackFps; onionSkin = saved.onionSkin; zoom = saved.zoom; canvasPan = { x: 0, y: 0 };
+    playbackFps = saved.playbackFps; onionSkin = saved.onionSkin; onionSkinScope = saved.onionSkinScope; onionSkinRadius = saved.onionSkinRadius; zoom = saved.zoom; canvasPan = { x: 0, y: 0 };
     projectPath = pathOrName; undoStack = []; redoStack = []; dirty = false;
     requestAnimationFrame(() => {
       collectPivots();
@@ -848,6 +854,44 @@
     status = onionSkin
       ? "Onion skin enabled · previous red 40% · next blue 40%"
       : "Onion skin disabled";
+  }
+  function toggleOnionSkinScope() {
+    onionSkinScope = onionSkinScope === "all" ? "selected" : "all";
+    dirty = true;
+    schedulePreview();
+    schedulePersist();
+    status = onionSkinScope === "all"
+      ? "Onion skin scope · all vectors"
+      : selectedBone?.groupKey
+        ? `Onion skin scope · ${selectedBone.name} vector`
+        : "Select a bound bone to show its onion vector";
+  }
+  function changeOnionSkinRadius(event: Event) {
+    onionSkinRadius = Math.max(1, Math.min(8, Math.round(Number((event.currentTarget as HTMLSelectElement).value) || 1)));
+    dirty = true;
+    schedulePreview();
+    schedulePersist();
+    status = `Onion skin neighbor level · ${onionSkinRadius}`;
+  }
+  function onionSkinBoneGroups(): Set<string> | undefined {
+    if (onionSkinScope !== "selected" || !selectedBone?.groupKey) return undefined;
+    const distances = new Map<string, number>([[selectedBone.id, 0]]);
+    const frontier = [selectedBone.id];
+    const maxDistance = Math.max(0, onionSkinRadius - 1);
+    while (frontier.length > 0) {
+      const boneId = frontier.shift()!;
+      const distance = distances.get(boneId) ?? 0;
+      if (distance >= maxDistance) continue;
+      for (const neighbor of bones) {
+        const connected = neighbor.id === boneId
+          ? false
+          : neighbor.parentId === boneId || bones.find((item) => item.id === boneId)?.parentId === neighbor.id;
+        if (!connected || distances.has(neighbor.id)) continue;
+        distances.set(neighbor.id, distance + 1);
+        frontier.push(neighbor.id);
+      }
+    }
+    return new Set(bones.filter((bone) => distances.has(bone.id) && bone.groupKey).map((bone) => bone.groupKey!));
   }
   function changePlaybackFps(event: Event) {
     playbackFps = Number((event.currentTarget as HTMLSelectElement).value) || 2;
@@ -1775,12 +1819,13 @@
     const paletteSize = Math.round(aiPaletteSize);
     const previewOptions = { antiAlias, resizeMode };
     let neighbors = onionSkin && !isPlaying ? wrappedPoseNeighbors(poses, activePoseId) : null;
+    const onionGroupKeys = onionSkinBoneGroups();
     let previousSvg: string | null = null;
     let nextSvg: string | null = null;
     try {
       if (neighbors) {
-        previousSvg = serializePoseFrame(neighbors.previous);
-        nextSvg = serializePoseFrame(neighbors.next);
+        previousSvg = serializePoseFrame(neighbors.previous, onionGroupKeys);
+        nextSvg = serializePoseFrame(neighbors.next, onionGroupKeys);
         restoreActivePoseHost();
       }
     } catch (error) {
@@ -1837,7 +1882,7 @@
   }
   function schedulePersist() {
     if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, preferredRigEditMode, aiPixelFilter, aiPaletteSize, pixelContourStrength, pixelDetailFloor, pixelCoverageThreshold, primaryView: viewMode, pixelVisible, playbackFps, onionSkin, zoom, canvasPan } satisfies Session)), 250);
+    persistTimer = setTimeout(() => localStorage.setItem("asset-studio:last-session", JSON.stringify({ sourceSvg, fileName, poses, bones, setupBoneTransforms, rigTransformModel: 2, activePoseId, outputWidth, outputHeight, antiAlias, resizeMode, rigEditMode, preferredRigEditMode, aiPixelFilter, aiPaletteSize, pixelContourStrength, pixelDetailFloor, pixelCoverageThreshold, primaryView: viewMode, pixelVisible, playbackFps, onionSkin, onionSkinScope, onionSkinRadius, zoom, canvasPan } satisfies Session)), 250);
   }
   async function exportPngInBrowser(svg: string, name: string) {
     try {
@@ -1861,13 +1906,28 @@
       } else { await exportPngInBrowser(svg, defaultName); status = `Exported ${defaultName}`; }
     } catch (error) { status = error instanceof Error ? error.message : String(error); }
   }
-  function applyPoseFrameToHost(pose: Pose | null, deformFromRig = true, matrixOverrides?: Record<string, Matrix>) {
+  function applyOnionVectorFilter(groupKeys?: ReadonlySet<string>) {
+    for (const shape of Array.from(svgHost.querySelectorAll<SVGGraphicsElement>("[data-studio-shape-group]"))) {
+      const shouldHide = groupKeys !== undefined && !groupKeys.has(shape.dataset.studioShapeGroup ?? "");
+      if (shouldHide) {
+        if (!shape.hasAttribute("data-studio-onion-display")) {
+          shape.setAttribute("data-studio-onion-display", shape.style.display);
+        }
+        shape.style.display = "none";
+      } else if (shape.hasAttribute("data-studio-onion-display")) {
+        shape.style.display = shape.getAttribute("data-studio-onion-display") ?? "";
+        shape.removeAttribute("data-studio-onion-display");
+      }
+    }
+  }
+  function applyPoseFrameToHost(pose: Pose | null, deformFromRig = true, matrixOverrides?: Record<string, Matrix>, onionGroupKeys?: ReadonlySet<string>) {
     const matrices = matrixOverrides ?? calculatedGroupMatricesFor(pose);
     for (const group of groups) {
       setWrapperMatrix(svgHost, group.key, matrices[group.key]);
       setWrapperVisibility(svgHost, group.key, groupIsVisible(group.key, pose));
     }
     applyPoseShapePaths(pose, deformFromRig);
+    applyOnionVectorFilter(onionGroupKeys);
   }
   function restoreActivePoseHost() {
     const calculated = calculatedGroupMatrices();
@@ -1880,8 +1940,8 @@
     selectWrapper(svgHost, selectedGroupKey);
     highlightBoneWrapper(svgHost, selectedBone?.groupKey ?? null);
   }
-  function serializePoseFrame(pose: Pose | null): string {
-    applyPoseFrameToHost(pose, true);
+  function serializePoseFrame(pose: Pose | null, onionGroupKeys?: ReadonlySet<string>): string {
+    applyPoseFrameToHost(pose, true, undefined, onionGroupKeys);
     return serializeForExport(svgHost);
   }
   function serializeAllFrames(): string[] {
@@ -2137,6 +2197,7 @@
     <div class="pose-actions">
       <div class="playback-control"><button class:playing={isPlaying} disabled={!sourceSvg || poses.length === 0} onclick={togglePlayback}><span>{isPlaying ? "■" : "▶"}</span>{isPlaying ? "STOP" : "PLAY POSES"}</button><select aria-label="Playback speed" value={playbackFps} onchange={changePlaybackFps}><option value="1">1 FPS</option><option value="2">2 FPS</option><option value="4">4 FPS</option><option value="8">8 FPS</option><option value="12">12 FPS</option></select></div>
       <button class:active={onionSkin} class:paused={onionSkin && isPlaying} class="onion-skin-toggle" disabled={!sourceSvg || poses.length < 2} aria-pressed={onionSkin} onclick={toggleOnionSkin} title="Show previous pose in red and next pose in blue on the pixel canvas"><span class="onion-colors"><i></i><i></i></span><strong>ONION SKIN</strong><small>{onionSkin && isPlaying ? "PAUSED DURING PLAY" : "PREV 40% · NEXT 40%"}</small><b>{onionSkin ? "ON" : "OFF"}</b></button>
+      <div class="onion-scope-control"><button class:active={onionSkinScope === "selected"} class="onion-scope-toggle" disabled={!onionSkin || !selectedBone?.groupKey} aria-pressed={onionSkinScope === "selected"} onclick={toggleOnionSkinScope} title="Choose whether onion skin shows all vectors or only the selected bone's vector"><strong>{onionSkinScope === "all" ? "ALL VECTORS" : "SELECTED BONE"}</strong><small>{onionSkinScope === "all" ? "ALL BONES" : selectedBone?.name ?? "SELECT A BOUND BONE"}</small></button><select class="onion-radius-control" aria-label="Onion skin neighbor level" disabled={!onionSkin || onionSkinScope !== "selected" || !selectedBone?.groupKey} value={onionSkinRadius} onchange={changeOnionSkinRadius}>{#each [1, 2, 3, 4, 5, 6, 7, 8] as level}<option value={level}>{level} neighbor{level === 1 ? "" : "s"}</option>{/each}</select></div>
       <small class="frame-readout">{poses.length} POSE{poses.length === 1 ? "" : "S"} · {frameCount} EXPORT FRAME{frameCount === 1 ? "" : "S"}</small>
       {#if activePose}<input aria-label="Pose name" value={activePose.name} onchange={renamePose} /><button onclick={duplicatePose}>DUPLICATE</button>{:else}<span>REST PREVIEW · NOT EXPORTED</span>{/if}
     </div>

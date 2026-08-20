@@ -28,6 +28,8 @@ function fixture(): AstdProjectState {
     pixelVisible: true,
     playbackFps: 4,
     onionSkin: true,
+    onionSkinScope: "all",
+    onionSkinRadius: 1,
     zoom: 1.2,
   };
 }
